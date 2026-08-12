@@ -319,9 +319,14 @@ class RuntimeRunner:
         )
 
     def _react_loop(self, pending_input: str, show_raw: bool, trace_logger) -> str:
+        # ReAct 主循环：每次迭代 = 一个 step（思考→动作→观察）
+        # 整体结构：外层 for 控制最大步数，内层 while 处理单步内的模型错误重试
         host = self.host
         tool_choice = "auto"
+        # 完成门被拦截后最多重试次数（默认 2）
         completion_retry_limit = int(getattr(host, "completion_gate_retry_limit", 2) or 2)
+
+        # 初始化不可变状态机，每次状态转移产生新对象，不修改原对象
         state = LoopState(
             messages=[],
             step=1,
@@ -336,13 +341,17 @@ class RuntimeRunner:
             pending_input_len=len(pending_input or ""),
         )
 
+        # ── 外层循环：每次迭代是一个 ReAct step ──────────────────────────────
         for step in range(1, host.max_steps + 1):
+            # 构建本轮发给模型的消息列表（history 的有界投影 + 工具 schema）
+            # pending_input 只在第一步追加到消息里，后续步骤已在历史中
             state, tools_schema, messages = self._prepare_step_context(
                 state=state,
                 pending_input=pending_input,
                 step=step,
                 trace_logger=trace_logger,
             )
+            # base_messages 用于空响应重试时拼接提示，保留本步的原始消息快照
             base_messages = messages
 
             response_text = ""
@@ -350,10 +359,15 @@ class RuntimeRunner:
             reasoning_content = None
             response_meta: dict[str, Any] = {}
 
+            # ── 内层循环：单步内的模型调用与错误恢复 ──────────────────────────
+            # 正常情况一次 break 出去；出错时根据错误类型决定重试或终止
             while True:
                 try:
+                    # 调 LLM，拿到原始响应对象
                     raw_response = host.llm.invoke_raw(messages, tools=tools_schema, tool_choice=tool_choice)
                 except Exception as exc:
+                    # ── 模型调用异常处理 ──
+                    # 对异常分类：PROMPT_TOO_LONG / API_ERROR / UNKNOWN 等
                     classification = classify_model_error(error=exc)
                     retry_count = state.model_recovery_counts.get(classification.kind.value, 0)
                     retry_limit = self._get_model_recovery_limit(classification.kind)
@@ -373,6 +387,8 @@ class RuntimeRunner:
                         and retry_count < retry_limit
                         and hasattr(host.context_engine, "reactive_compact")
                     ):
+                        # PROMPT_TOO_LONG：触发上下文压缩后重试
+                        # reactive_compact 对旧历史做 LLM 摘要，缩短 token 后重建 model view
                         next_retry_count = retry_count + 1
                         recovery_counts = self._increment_model_recovery_count(state, classification.kind)
                         self._trace_model_recovery_attempted(
@@ -390,6 +406,7 @@ class RuntimeRunner:
                             trace_logger=trace_logger,
                         )
                         if compact_info.get("compacted"):
+                            # 压缩成功：记录 checkpoint，重建 model view，内层 continue 重试
                             self._record_active_transcript_checkpoint(step=step)
                             state = self._transition(
                                 state,
@@ -430,6 +447,7 @@ class RuntimeRunner:
                             )
                             continue
 
+                        # 压缩失败：无法恢复，走终止路径
                         self._trace_model_recovery_failed(
                             trace_logger,
                             step=step,
@@ -457,6 +475,7 @@ class RuntimeRunner:
                             },
                         )
                     else:
+                        # 其他错误或重试次数已耗尽：直接标记恢复失败
                         self._trace_model_recovery_failed(
                             trace_logger,
                             step=step,
@@ -480,6 +499,7 @@ class RuntimeRunner:
                             },
                         )
 
+                    # 模型调用异常无法恢复，终止整个 loop
                     self._terminal(
                         TerminalReason.MODEL_ERROR,
                         trace_logger,
@@ -491,7 +511,9 @@ class RuntimeRunner:
                     )
                     return "抱歉，我无法在限定步数内完成这个任务。"
 
+                # ── 模型调用成功，解析响应 ────────────────────────────────────
                 if show_raw:
+                    # --show-raw 模式：把原始响应存到 host 上，供 CLI 打印调试
                     host.last_response_raw = (
                         raw_response.model_dump()
                         if hasattr(raw_response, "model_dump")
@@ -505,6 +527,7 @@ class RuntimeRunner:
                     host.context_engine.record_usage(usage["total_tokens"])
                     max_total_tokens = int(getattr(host, "max_total_tokens", 0) or 0)
                     if max_total_tokens and host.context_engine.total_usage_tokens > max_total_tokens:
+                        # token 累计用量超出预算上限，强制终止
                         state = self._transition(
                             state,
                             TransitionReason.TOKEN_BUDGET_EXCEEDED,
@@ -545,6 +568,7 @@ class RuntimeRunner:
                         display_reasoning = display_reasoning[:1200] + "...(truncated)"
                     host._console(f"\n🧠 Reasoning: {display_reasoning}\n")
 
+                # 检查响应内容是否有问题（空响应 / 输出超长截断）
                 classification = None
                 candidate_error = classify_model_error(
                     response_text=response_text,
@@ -554,9 +578,11 @@ class RuntimeRunner:
                 if candidate_error.kind in {ModelErrorKind.EMPTY_RESPONSE, ModelErrorKind.MAX_OUTPUT}:
                     classification = candidate_error
 
+                # 响应正常，跳出内层 while，进入后续的 tool_calls / 完成门判断
                 if classification is None:
                     break
 
+                # ── 响应异常处理（空响应 / 输出截断）────────────────────────────
                 retry_count = state.model_recovery_counts.get(classification.kind.value, 0)
                 retry_limit = self._get_model_recovery_limit(classification.kind)
                 self._trace_model_error_classified(
@@ -571,6 +597,7 @@ class RuntimeRunner:
                 )
 
                 if classification.kind is ModelErrorKind.EMPTY_RESPONSE and retry_count < retry_limit:
+                    # 空响应：追加一条提示 user 消息告诉模型"请给出回答"，内层 continue 重试
                     next_retry_count = retry_count + 1
                     recovery_counts = self._increment_model_recovery_count(state, classification.kind)
                     hint = "上次 content 为空且未返回 tool_calls，请在 content 中回复最终答案，或使用工具调用。"
@@ -616,6 +643,7 @@ class RuntimeRunner:
                         host.logger.warning("LLM返回空响应，追加提示后重试一次")
                     continue
 
+                # 重试次数耗尽或不可恢复，终止
                 self._trace_model_recovery_failed(
                     trace_logger,
                     step=step,
@@ -677,7 +705,11 @@ class RuntimeRunner:
                     )
                 return "抱歉，我无法在限定步数内完成这个任务。"
 
+            # ── 内层 while 正常 break 出来，处理本步的响应结果 ─────────────────
+
             if tool_calls:
+                # ── Acting 分支：模型返回了工具调用 ──────────────────────────
+                # 1. 记录状态转移
                 state = self._transition(
                     state,
                     TransitionReason.MODEL_RETURNED_TOOL_CALLS,
@@ -687,9 +719,11 @@ class RuntimeRunner:
                     last_response_meta=response_meta,
                     details={"tool_count": len(tool_calls)},
                 )
+                # 2. 确保每个 tool_call 有 id（部分模型不返回 id）
                 for call in tool_calls:
                     if not call.get("id"):
                         call["id"] = f"call_{uuid.uuid4().hex}"
+                # 3. 把 assistant 消息（含 tool_calls）写入历史
                 assistant_content = str(response_text or "")
                 host.history_manager.append_assistant(
                     content=assistant_content,
@@ -709,11 +743,13 @@ class RuntimeRunner:
                     },
                     step=step,
                 )
+                # 4. 执行工具（ToolOrchestrator 负责并发/串行调度）
                 observations = host.tool_orchestrator.run(
                     tool_calls,
                     step=step,
                     trace_logger=trace_logger,
                 )
+                # 5. 把每个工具的执行结果作为 tool 消息写入历史，供下一步模型看到
                 for obs in observations:
                     obs_metadata = getattr(obs, "metadata", None) or {}
                     host.history_manager.append_tool(
@@ -757,9 +793,17 @@ class RuntimeRunner:
                     last_tool_calls=tool_calls,
                     details={"tool_count": len(tool_calls)},
                 )
+                # 工具执行完，外层 for 继续下一个 step（模型看到观测结果后再思考）
                 continue
 
+            # ── Reasoning 分支：模型没有返回工具调用，输出了文字 ─────────────
+            # 不能直接返回，先经过完成门检查
             final_text = str(response_text).strip()
+
+            # 收集完成检查所需的三类信息：
+            # candidate：本次回答内容
+            # requirements：从用户输入推断出的完成要求（如"需要跑测试"）
+            # evidence：历史中的工具执行证据（如"Bash 跑了 pytest"）
             candidate = build_completion_candidate(
                 final_text=final_text,
                 step=step,
@@ -786,6 +830,7 @@ class RuntimeRunner:
             for item in evidence:
                 self._emit("verification_evidence", item.to_trace_payload(), step=step)
 
+            # 完成门判决：PASS / UNVERIFIED / FAIL
             verdict = self._get_completion_verifier().evaluate(
                 candidate,
                 requirements,
@@ -799,6 +844,8 @@ class RuntimeRunner:
             )
 
             if verdict.verdict in {CompletionGateVerdict.PASS, CompletionGateVerdict.UNVERIFIED}:
+                # ── 完成门通过：正常出口 ──────────────────────────────────────
+                # PASS：确认完成；UNVERIFIED：有验证要求但缺证据，以"未确认完成"状态退出
                 action_type = "final" if verdict.verdict is CompletionGateVerdict.PASS else "final_unverified"
                 host.history_manager.append_assistant(
                     content=final_text,
@@ -847,6 +894,9 @@ class RuntimeRunner:
                 )
                 return final_text
 
+            # ── 完成门拦截（FAIL）：注入反馈，让模型重新来过 ─────────────────
+            # 把本次"失败的回答"记入历史，同时把门的拦截原因作为 user 消息注入，
+            # 模型下一步能看到"为什么不通过"并做出修正
             host.history_manager.append_assistant(
                 content=final_text,
                 metadata={"step": step, "action_type": "final_candidate"},
@@ -891,6 +941,7 @@ class RuntimeRunner:
                 },
             )
             if block_count >= completion_retry_limit:
+                # 完成门反馈重试次数耗尽，强制终止
                 self._terminal(
                     TerminalReason.COMPLETION_GATE_BLOCKED,
                     trace_logger,
@@ -901,8 +952,10 @@ class RuntimeRunner:
                     retry_limit=completion_retry_limit,
                 )
                 return "抱歉，我无法在限定步数内完成这个任务。"
+            # 注入反馈后外层 for 继续下一个 step，模型看到反馈后重新思考
             continue
 
+        # ── 超出最大步数，强制终止 ───────────────────────────────────────────
         state = self._transition(
             state,
             TransitionReason.MAX_STEPS_EXCEEDED,

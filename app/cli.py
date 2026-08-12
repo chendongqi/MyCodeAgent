@@ -404,19 +404,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # ── 阶段 1：解析命令行参数 ──────────────────────────────────────────────
+    # args 里有 provider/model/api-key 等 LLM 覆盖参数，以及 -p 一次性模式标志
     parser = build_parser()
     args = parser.parse_args()
+    # one_shot=True：非交互模式（python main.py -p "你的问题"，跑完即退出）
+    # one_shot=False：交互模式（进入 while True 循环等待用户输入）
     one_shot = getattr(args, "print_prompt", None) is not None
     if getattr(args, "json", False) and not one_shot:
         parser.error("--json requires -p/--print")
     if one_shot and not args.print_prompt.strip():
         parser.error("-p/--print requires a non-empty prompt")
 
+    # ── 阶段 2：组装运行时（依赖注入）─────────────────────────────────────
+    # build_runtime 按顺序创建：Config → LLM → ToolRegistry → CodeAgent
+    # 交互模式额外创建 EnhancedUI，通过 agent_kwargs_factory 注入给 agent
     try:
         runtime_kwargs: dict[str, Any] = {
+            # 交互模式用 RichConsoleCodeAgent（重写了 _console/_execute_tool 加 UI 渲染）
+            # 一次性模式用裸 CodeAgent（无 UI 开销）
             "agent_class": CodeAgent if one_shot else RichConsoleCodeAgent
         }
         if not one_shot:
+            # 只是声明"将来收到这三个参数后做什么"
+            # 用 lambda 就是把「创建 UI 这个动作」打包成一个回调，等 bootstrap 把依赖都准备好之后再执行。这是依赖注入的经典写法：调用方不知道被注入物的细节，只提供一个工厂函数
             runtime_kwargs["agent_kwargs_factory"] = lambda config, llm, project_root: {
                 "ui": EnhancedUI(
                     console=console,
@@ -426,6 +437,7 @@ def main() -> None:
                     version="v1.0",
                 )
             }
+        # runtime 是一个 RuntimeBootstrap dataclass，持有 config/llm/tool_registry/agent
         runtime = build_runtime(args, **runtime_kwargs)
     except Exception as exc:
         if one_shot and getattr(args, "json", False):
@@ -445,9 +457,11 @@ def main() -> None:
             console.print(f"[error]Failed to initialize runtime: {exc}[/error]")
         raise SystemExit(2)
 
+    # ── 阶段 3a：一次性模式（-p 参数）────────────────────────────────────
     if one_shot:
         if getattr(args, "resume", None) is not None:
             try:
+                # 实际上这里会调用CodeAgent的resume_transcript方法，最终会调用TranscriptStore的resume_transcript方法
                 runtime.agent.resume_transcript(getattr(args, "resume") or None)
             except ValueError as exc:
                 if getattr(args, "json", False):
@@ -465,11 +479,14 @@ def main() -> None:
                     print(f"Failed to resume transcript: {exc}", file=sys.stderr)
                 runtime.agent.close()
                 raise SystemExit(2)
+        # run_one_shot → agent.run(prompt) → RuntimeRunner.run() → ReAct 循环 → 返回结果
         raise SystemExit(run_one_shot(args, runtime))
 
+    # ── 阶段 3b：交互模式 ─────────────────────────────────────────────────
     agent = runtime.agent
     project_root = runtime.project_root
     enhanced_ui = agent.ui
+    # 检查code_law.md是否存在，编码规范
     code_law_exists = check_code_law_exists(project_root)
     _print_banner(code_law_exists, enhanced_ui)
     _default_session_path(project_root)
@@ -484,6 +501,7 @@ def main() -> None:
             raise SystemExit(2)
         console.print(f"[bold green]✓ Resumed transcript:[/bold green] {resume.session_id} ({resume.run_id})")
 
+    # .chat_history 保存输入历史，让 prompt_toolkit 支持上下键翻历史
     history_file = os.path.join(project_root, ".chat_history")
     session = PromptSession(history=FileHistory(history_file))
     prompt_style = PromptStyle.from_dict(
@@ -495,8 +513,10 @@ def main() -> None:
     )
 
     try:
+        # ── 主循环：每次迭代 = 一轮对话 ────────────────────────────────────
         while True:
             try:
+                # 阻塞等待用户输入（prompt_toolkit 提供行编辑和历史）
                 user_input = session.prompt(
                     HTML("<user>user</user> <arrow>➜</arrow> "),
                     style=prompt_style,
@@ -505,21 +525,26 @@ def main() -> None:
                 console.print("\n[dim]Goodbye![/dim]")
                 _maybe_save_session(agent, auto_save_flag, "keyboard interrupt")
                 break
-
+            # 如果用户输入为空，则继续下一轮
             if not user_input:
                 continue
+            # 如果用户输入为exit, quit, q，则退出程序
             if user_input.lower() in {"exit", "quit", "q"}:
                 console.print("\n[dim]Shutting down...[/dim]")
                 _maybe_save_session(agent, auto_save_flag, "exit")
                 break
 
+            # / 开头的是内置命令，不交给 agent 处理
             if user_input.startswith("/"):
+                # /status /sessions /resume：session 生命周期管理，在 handle_lifecycle_command 里处理
                 if handle_lifecycle_command(agent, user_input):
                     continue
+                # /model /info：显示当前模型信息和 token 用量统计
                 if user_input.lower() in {"/model", "/info"}:
                     enhanced_ui.show_banner()
                     enhanced_ui.show_detailed_token_summary()
                     continue
+                # /save：打印当前 transcript 文件路径（transcript 始终是 append-only 持久化的，无需手动保存）
                 if user_input.lower().startswith("/save"):
                     try:
                         console.print(
@@ -528,6 +553,7 @@ def main() -> None:
                     except Exception as exc:
                         console.print(f"[bold red]✗ Save failed:[/bold red] {exc}")
                     continue
+                # /load [path]：从指定路径加载历史 transcript，恢复之前的对话上下文
                 if user_input.lower().startswith("/load"):
                     parts = user_input.split(maxsplit=1)
                     path = parts[1].strip() if len(parts) > 1 else str(agent.transcript_path())
@@ -540,6 +566,7 @@ def main() -> None:
                     except Exception as exc:
                         console.print(f"[bold red]✗ Load failed:[/bold red] {exc}")
                     continue
+                # /help：打印所有可用命令列表
                 if user_input.lower() == "/help":
                     console.print(
                         Panel(
@@ -559,6 +586,8 @@ def main() -> None:
                     )
                     continue
 
+            # init 命令：让 agent 扫描项目，生成 code_law.md（项目规范文件）
+            # code_law.md 会被自动注入系统提示词，告诉 agent 这个项目的规范和常用命令
             if "init" in user_input.lower() and len(user_input) < 10:
                 if code_law_exists:
                     console.print("\n[warning]code_law.md already exists.[/warning]")
@@ -600,17 +629,22 @@ def main() -> None:
                     console.print("[bold red]✗ Failed to generate code_law.md[/bold red]")
                 continue
 
+            # 每轮开始前重置 UI 状态（工具调用树、token 计数）
             enhanced_ui.tool_tree = ToolCallTree()
             enhanced_ui.token_tracker.calls.clear()
 
             start_time = time.time()
             console.print()
+            # ▶ 核心调用：把用户输入交给 agent，agent 内部跑 ReAct 循环
+            # run_interactive_turn → agent.run(user_input) → RuntimeRunner.run()
+            # 返回后 response 是最终文字回答（ReAct 循环结束的产物）
             turn = run_interactive_turn(agent, user_input, show_raw=args.show_raw)
             if turn.cancelled:
                 continue
             response = turn.response or ""
             elapsed = time.time() - start_time
 
+            # 渲染本轮结果：工具调用树 + 最终回答 + token 统计
             console.print()
             enhanced_ui.show_tool_tree()
             _print_assistant_response(response)

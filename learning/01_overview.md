@@ -25,8 +25,10 @@
                │
                ▼
 ┌─────────────────────────────────────────┐
-│  runtime/factory.py                     │
-│  根据 Config 创建 CodeAgent 实例         │
+│  app/bootstrap.py  build_runtime()      │
+│  组装入口：Config→LLM→ToolRegistry→Agent │
+│  （runtime/factory.py 是 host 内部助手， │
+│   负责挂载子组件，不对外创建 agent）      │
 └──────────────┬──────────────────────────┘
                │
                ▼

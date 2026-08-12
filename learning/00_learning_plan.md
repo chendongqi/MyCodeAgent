@@ -97,12 +97,19 @@
 ### 模块 5：组装与启动
 **文档**：06_bootstrap_assembly.md（待写）  
 **目标**：看清楚一个 agent 实例是怎么从零组装出来的  
-**关键文件**：`runtime/host.py`、`runtime/factory.py`、`app/bootstrap.py`、`app/cli.py`  
+**关键文件**：`app/cli.py`、`app/bootstrap.py`、`runtime/host.py`、`runtime/factory.py`  
+**文件职责**：
+- `app/cli.py`：解析命令行参数 + 驱动交互循环
+- `app/bootstrap.py`：**真正的组装入口**，按顺序创建 Config → LLM → ToolRegistry → CodeAgent
+- `runtime/host.py`：CodeAgent 类定义，是所有运行时依赖的容器
+- `runtime/factory.py`：被 `host.py` 内部调用，负责给 CodeAgent 挂载子组件（HistoryManager、ContextEngine、TranscriptStore 等），不对外创建 agent
+
 **核心内容**：
 - `CodeAgent` 作为依赖容器（不是通过继承，而是组合）
-- factory 模式：根据 Config 决定启用哪些扩展
-- 内置工具的注册过程
-- CLI → factory → RuntimeRunner 的完整启动链
+- `bootstrap.py` 的依赖注入：Config → LLM → ToolRegistry → CodeAgent 的创建顺序
+- `agent_kwargs_factory`：用 lambda 延迟创建 EnhancedUI，等 LLM 对象就绪后再执行
+- 内置工具的注册过程（`_initialize_runtime_components` 中的 ① ～ ⑥）
+- CLI → bootstrap → host → RuntimeRunner 的完整启动链
 
 ---
 

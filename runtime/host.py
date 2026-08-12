@@ -58,9 +58,9 @@ class CodeAgent:
             return self._get_launcher().launch(request)
     
     def __init__(
-        self, 
-        name: str, 
-        llm: HelloAgentsLLM, 
+        self,
+        name: str,
+        llm: HelloAgentsLLM,
         tool_registry: ToolRegistry,
         project_root: str,
         package_resource_root: Optional[str] = None,
@@ -71,13 +71,14 @@ class CodeAgent:
         enable_tracing: Optional[bool] = None,
         logger=None,
     ):
+        # bootstrap.py 传入的依赖全部保存到 self，作为整个 agent 的状态容器
         self.name = name
-        self.llm = llm
+        self.llm = llm          # LLM 客户端（core/llm.py HelloAgentsLLM）
         self.system_prompt = system_prompt
         self.config = config or Config.from_env()
         self.project_root = project_root
         self.package_resource_root = package_resource_root
-        self.tool_registry = tool_registry
+        self.tool_registry = tool_registry  # 空注册表，内置工具由下面的初始化方法注册进去
         self.logger = logger or setup_logger(
             name=f"agent.{self.name}",
             level=self.config.log_level,
@@ -90,11 +91,16 @@ class CodeAgent:
         self.enable_mcp = self.config.enable_mcp if enable_mcp is None else bool(enable_mcp)
         self.enable_skills = self.config.enable_skills if enable_skills is None else bool(enable_skills)
         self.enable_tracing = self.config.enable_tracing if enable_tracing is None else bool(enable_tracing)
+        # ▶ 关键：按依赖顺序初始化所有运行时组件
         self._initialize_runtime_components()
 
     def _initialize_runtime_components(self) -> None:
         """Build runtime components in dependency order."""
+        # ① 上下文引擎：管理历史消息、token 预算、压缩策略
+        #    完成后 self 上会有 history_manager / context_engine / context_builder 等属性
         build_runtime_context(self)
+
+        # ② 持久化：创建 trace_logger（写 JSONL/HTML 日志）和 transcript_store（崩溃恢复）
         build_runtime_persistence(
             self,
             trace_logger_factory=lambda trace_dir: create_trace_logger(
@@ -104,6 +110,8 @@ class CodeAgent:
             ),
             null_trace_logger_factory=NullTraceLogger,
         )
+
+        # ③ 工具执行器：单个工具的权限检查 + 实际调用（tools/executor.py）
         self.tool_executor = ToolExecutor(
             self.tool_registry,
             context=ToolExecutionContext(
@@ -112,15 +120,37 @@ class CodeAgent:
                 project_root=self.project_root,
             ),
         )
+
+        # ④ 工具编排器：批量执行多个工具调用（只读并发，写操作串行）
         self.tool_orchestrator = ToolOrchestrator(self)
+
+        # ⑤ ReAct 主循环驱动器（runtime/loop.py）
+        #    agent.run(user_input) 实际调的是 self.runner.run(user_input)
         self.runner = RuntimeRunner(self)
+
         self.subagent_launcher = None
+        # ⑥（可选）验证子 agent：主 agent 说"完成了"后，派一个独立轻量子 agent 来交叉核查
+        #    默认关闭，需要 --enable-verification-agent 参数显式开启
+        #    开启后，completion_verifier.evaluate() 不再只做规则判断，
+        #    而是启动子 agent 独立跑一遍，回来报告 PASS / FAIL / UNVERIFIED
+        #    _get_subagent_launcher() 用惰性初始化：等真正需要时才创建，避免 CodeAgent
+        #    还没初始化完就要用自己的子 agent 系统（循环依赖）
         if self.config.enable_verification_agent:
             from runtime.subagents import SubagentCompletionVerifier
-
             self.completion_verifier = SubagentCompletionVerifier(
                 self._get_subagent_launcher()
             )
+
+        # ⑦ 注册 Task 工具（必须最后注册）
+        #    其他内置工具（Glob/Grep/Read/Edit/Bash 等）在 ① build_runtime_context 里
+        #    通过 _register_builtin_tools() 批量注册。
+        #    TaskTool 单独放在最后，原因：它的 launcher 需要访问完整初始化好的 CodeAgent，
+        #    如果在 ① 阶段注册，ToolExecutor/ToolOrchestrator/RuntimeRunner 还不存在，
+        #    launcher 拿到的是半成品 agent，会出错。
+        #
+        #    执行链路：loop → ToolOrchestrator → ToolExecutor → registry.get(name).run()
+        #    ToolExecutor/ToolOrchestrator 只管执行，不关心工具何时注册，
+        #    只要第一次被调用前注册完即可。
         self.tool_registry.register_tool(
             TaskTool(
                 project_root=Path(self.project_root),
@@ -196,6 +226,7 @@ class CodeAgent:
                 self.logger.warning("MCP registration skipped: %s", exc)
 
     def run(self, input_text: str, **kwargs) -> str:
+        # 对外暴露的唯一入口：cli 调 agent.run(user_input)，实际委托给 RuntimeRunner
         return self.runner.run(input_text, **kwargs)
 
     def __str__(self) -> str:

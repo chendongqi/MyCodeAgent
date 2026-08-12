@@ -48,9 +48,11 @@ def build_runtime(
 ) -> RuntimeBootstrap:
     """Assemble config, llm, registry, and agent without starting the UI loop."""
 
+    # 步骤 1：确定 project_root（优先 --cwd 参数，否则用当前目录）
     selected_project_root = project_root if project_root is not None else getattr(args, "cwd", None)
     resolved_project_root = resolve_project_root(selected_project_root)
 
+    # 步骤 2：加载配置（从 .env 读取所有环境变量，命令行参数可覆盖部分字段）
     config = config_class.from_env()
     for argument, attribute in (
         ("enable_mcp", "enable_mcp"),
@@ -59,6 +61,7 @@ def build_runtime(
         if getattr(args, argument, False):
             setattr(config, attribute, True)
 
+    # 步骤 3：创建 LLM 客户端（命令行参数优先，其次 config，最后环境变量）
     llm = llm_class(
         model=getattr(args, "model", None),
         api_key=getattr(args, "api_key", None),
@@ -71,8 +74,10 @@ def build_runtime(
         ),
     )
 
+    # 步骤 4：创建空工具注册表（内置工具由 CodeAgent.__init__ 负责注册）
     tool_registry = tool_registry_factory()
 
+    # 步骤 5：组装 agent 的构造参数（依赖注入：LLM + 工具注册表 + 配置全在这里传入）
     agent_kwargs = {
         "name": getattr(args, "name", "code"),
         "llm": llm,
@@ -92,9 +97,11 @@ def build_runtime(
             agent_kwargs["enable_skills"] = bool(extension_flags["skills"])
         if "tracing" in extension_flags:
             agent_kwargs["enable_tracing"] = bool(extension_flags["tracing"])
+    # 交互模式通过 agent_kwargs_factory 额外注入 EnhancedUI 对象
     if agent_kwargs_factory is not None:
         agent_kwargs.update(agent_kwargs_factory(config, llm, resolved_project_root))
 
+    # 步骤 6：实例化 agent（内部会注册所有内置工具并初始化上下文引擎）
     agent = agent_class(**agent_kwargs)
 
     return RuntimeBootstrap(
