@@ -343,8 +343,14 @@ class RuntimeRunner:
 
         # ── 外层循环：每次迭代是一个 ReAct step ──────────────────────────────
         for step in range(1, host.max_steps + 1):
-            # 构建本轮发给模型的消息列表（history 的有界投影 + 工具 schema）
-            # pending_input 只在第一步追加到消息里，后续步骤已在历史中
+            # 构建本轮发给模型的 Model View（≠ 完整 history）：
+            #   source  = history_manager 里的 append-only 全量消息（永不因压缩而删除）
+            #   project = ProjectionBuilder 在读取时做非破坏性投影：
+            #             无 checkpoint → full_history（原样）
+            #             有 checkpoint → compact_checkpoint（摘要 + 最近 N 轮）
+            #   view    = system prompt + session memory + 投影后的 history
+            # 「有界」= token 预算控制：超阈值触发 compact，模型只看到投影后的子集。
+            # pending_input 已在 _prepare_run 写入 history，此处仅用于 token 估算。
             state, tools_schema, messages = self._prepare_step_context(
                 state=state,
                 pending_input=pending_input,
@@ -520,6 +526,13 @@ class RuntimeRunner:
                         else raw_response
                     )
 
+                # 从同一份 raw_response 拆出不同用途的字段（core/llm.py 统一解析）：
+                # response_text     ← choices[0].message.content，模型输出的正文
+                # reasoning_content ← message.reasoning_content / reasoning（部分模型有）
+                # usage             ← response.usage，本轮 token 用量
+                # response_meta     ← 响应的结构化信号（不含正文），供容错/完成门/trace
+                # tool_calls        ← message.tool_calls，Function Calling 列表
+                # raw_dump          ← 完整响应的 JSON 快照，供 trace 审计
                 response_text = extract_response_content(raw_response) or ""
                 reasoning_content = extract_reasoning_content(raw_response)
                 usage = extract_usage(raw_response)
@@ -547,9 +560,13 @@ class RuntimeRunner:
                         )
                         return "抱歉，我无法在限定预算内完成这个任务。"
 
+                # response_meta 与 response_text 互补：
+                #   text → 写入 history、完成门候选答案、展示给用户
+                #   meta → finish_reason/content_len 等，驱动空响应重试、输出截断判定、状态机与 trace
                 response_meta = extract_response_meta(raw_response)
                 tool_calls = extract_tool_calls(raw_response)
                 raw_dump = serialize_response(raw_response)
+                # 把所有信息 emit 出去，供 trace 审计、完成门候选、空响应重试等决策使用
                 self._emit(
                     "model_output",
                     {
@@ -595,7 +612,7 @@ class RuntimeRunner:
                     message=classification.message,
                     finish_reason=classification.finish_reason,
                 )
-
+                # ── 空响应重试 ──────────────────────────────────────────────
                 if classification.kind is ModelErrorKind.EMPTY_RESPONSE and retry_count < retry_limit:
                     # 空响应：追加一条提示 user 消息告诉模型"请给出回答"，内层 continue 重试
                     next_retry_count = retry_count + 1
@@ -979,7 +996,11 @@ class RuntimeRunner:
         step: int,
         trace_logger,
     ) -> tuple[LoopState, list[dict[str, Any]], list[dict[str, Any]]]:
-        """Refresh runtime signals, compact history, and build the model view."""
+        """Refresh runtime signals, compact history, and build the model view.
+
+        返回的 messages 是 ModelView，不是 history_manager 的原始列表。
+        流程：compact_if_needed → build_model_view（内部 project + normalize）。
+        """
         host = self.host
         tools_schema = host._get_openai_tools_for_current_mode()
         self._trace_model_request_state(

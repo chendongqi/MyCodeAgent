@@ -1,4 +1,10 @@
-"""Read-time history projection."""
+"""Read-time history projection.
+
+HistoryManager 保存完整事实日志；本模块在**读取时**生成模型可见的子集，
+不修改 source。这就是 loop 里说的「有界投影」：
+  - full_history：尚未压缩，投影 = 全量历史
+  - compact_checkpoint：旧消息折叠成一条 summary，保留最近几轮原文
+"""
 
 from __future__ import annotations
 
