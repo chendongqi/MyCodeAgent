@@ -133,6 +133,10 @@ class ContextEngine:
         step: int = 0,
         trace_logger: Any = None,
     ) -> ModelView:
+        # 系列 04：最终发给模型的顺序 =
+        #   PromptAssembly 的 system 层（人格/工具说明书/项目规则/runtime）
+        # + 可选 session memory（另一条 system，按字符预算裁剪）
+        # + history 投影（user/assistant/tool/...）
         source_messages = history_manager.get_messages()
         projection = self.projection_builder.project(source_messages)
         history_messages = self.normalizer.normalize(projection.messages)

@@ -369,7 +369,8 @@ class RuntimeRunner:
             # 正常情况一次 break 出去；出错时根据错误类型决定重试或终止
             while True:
                 try:
-                    # 调 LLM，拿到原始响应对象
+                    # 系列 03：主循环必须用 invoke_raw（完整响应），不能用 invoke（只要字符串）
+                    # tools / tool_choice 原样下发；provider 怪癖在 llm._build_request 里消化
                     raw_response = host.llm.invoke_raw(messages, tools=tools_schema, tool_choice=tool_choice)
                 except Exception as exc:
                     # ── 模型调用异常处理 ──
@@ -526,13 +527,14 @@ class RuntimeRunner:
                         else raw_response
                     )
 
-                # 从同一份 raw_response 拆出不同用途的字段（core/llm.py 统一解析）：
-                # response_text     ← choices[0].message.content，模型输出的正文
-                # reasoning_content ← message.reasoning_content / reasoning（部分模型有）
-                # usage             ← response.usage，本轮 token 用量
-                # response_meta     ← 响应的结构化信号（不含正文），供容错/完成门/trace
-                # tool_calls        ← message.tool_calls，Function Calling 列表
-                # raw_dump          ← 完整响应的 JSON 快照，供 trace 审计
+                # 系列 03：各家响应格式在 core/llm.py 的 extract_* 里归一化。
+                # 主循环只消费统一字段，不直接解析 provider JSON：
+                # response_text     ← 正文（content 为 list 时已拼好）
+                # reasoning_content ← 可选思维链（展示用，不改控制流）
+                # usage             ← token 用量（预算 / 记账）
+                # response_meta     ← finish_reason 等信号（空响应重试 / 截断）
+                # tool_calls        ← [{id, name, arguments}]（含旧 function_call）
+                # raw_dump          ← 完整快照（trace 审计）
                 response_text = extract_response_content(raw_response) or ""
                 reasoning_content = extract_reasoning_content(raw_response)
                 usage = extract_usage(raw_response)

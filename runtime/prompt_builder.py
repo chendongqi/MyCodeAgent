@@ -1,20 +1,19 @@
 """Context builder for ReAct prompt assembly.
 
-重构为 Message List 自然累积模式：
-- 不再拼接 scratchpad，每步历史由 messages 自然累积
-- L1/L2 用 role=system 放在 messages 头部
-- L3 就是 messages 中的 user/assistant/tool
-- L4 当前用户输入以 role=user 追加
-- Todo recap 作为观察消息进入上下文（strict 时为 tool，否则为 user observation）
+系列 04：系统提示词组装层——agent「人格」从这里来，不是一段超长字符串。
 
-Messages 格式：
+分层（均为 role=system，再与 history 投影拼成 Model View）：
+  Constitution      ← L1 身份/语气/安全政策
+  Tool Contracts    ← tools_prompts 自然语言说明书（≠ tools= JSON schema）
+  Project Rules     ← 仓库 code_law.md
+  Runtime Signals   ← 运行时通知块（可变）
+
+Message List 模式（不再拼接 Thought/Action scratchpad）：
 [
-  {"role": "system", "content": "L1 系统提示 + 工具说明"},
-  {"role": "system", "content": "L2: CODE_LAW.md（如有）"},
-  {"role": "user", "content": "...问题..."},
-  {"role": "assistant", "content": "...", "tool_calls": [...]},
-  {"role": "tool", "tool_call_id": "...", "content": "{压缩后的JSON}"},
-  ...
+  {"role": "system", "content": "Constitution"},
+  {"role": "system", "content": "Tool Contracts"},
+  {"role": "system", "content": "Project Rules (可选)"},
+  {"role": "user"|"assistant"|"tool"|"summary", ...},  # history 投影
 ]
 """
 
@@ -39,6 +38,8 @@ def _hash_json(data: Any) -> str:
 
 @dataclass(frozen=True)
 class PromptAssembly:
+    """一次组装结果的分层快照 + 各层 fingerprint（缓存命中与 trace 对比用）。"""
+
     constitution_messages: List[Dict[str, Any]]
     tool_contract_messages: List[Dict[str, Any]]
     project_rule_messages: List[Dict[str, Any]]
@@ -55,14 +56,10 @@ class PromptAssembly:
 @dataclass
 class ContextBuilder:
     """
-    构建 ReAct 循环的 messages 列表
+    构建发给模型的 system 层 + 与 history 拼接的入口。
 
-    Message List 模式：
-    - L1(system+tools) 作为第一个 system message
-    - L2(CODE_LAW) 作为第二个 system message（如有）
-    - L3(history) 由 HistoryManager 提供的 messages 列表
-    - L4(user input) 已包含在 history 中
-    - Todo recap 作为 tool message 自然存在于 history 中
+    稳定三层（Constitution / Tool Contracts / CODE_LAW）可按 fingerprint 缓存；
+    Skills、MCP、runtime blocks 变更时 setter 会清空缓存强制重装。
     """
 
     tool_registry: "ToolRegistry"  # noqa: F821
@@ -95,7 +92,7 @@ class ContextBuilder:
         """
         messages: List[Dict[str, Any]] = []
         
-        # L1: System prompt + Tools（缓存）
+        # system 层在前，对话历史在后（主路径实际走 ContextEngine.build_model_view）
         system_messages = self._get_system_messages()
         messages.extend(system_messages)
         
@@ -110,6 +107,7 @@ class ContextBuilder:
         return [dict(m) for m in assembly.all_system_messages]
 
     def get_prompt_assembly(self) -> PromptAssembly:
+        # 系列 04：四层组装。{tools} 占位已废弃——工具细节在 Tool Contracts 层，此处清空。
         constitution_text = self._load_system_prompt().replace("{tools}", "").strip()
         code_law = self._load_code_law()
 
@@ -122,10 +120,12 @@ class ContextBuilder:
         runtime_signal_messages = self._build_runtime_signal_messages()
         runtime_signals_fingerprint = _hash_json(runtime_signal_messages)
 
+        # ① Constitution：跨项目稳定的身份与政策
         constitution_messages: List[Dict[str, Any]] = []
         if constitution_text:
             constitution_messages.append({"role": "system", "content": constitution_text})
 
+        # ② Tool Contracts：自然语言工具说明书（与 tools= JSON schema 是两条通道）
         tool_contract_messages: List[Dict[str, Any]] = []
         if tool_contracts_text:
             tool_contract_messages.append(
@@ -135,6 +135,7 @@ class ContextBuilder:
                 }
             )
 
+        # ③ Project Rules：本仓库特有约定（换项目主要换这一层）
         project_rule_messages: List[Dict[str, Any]] = []
         if code_law:
             project_rule_messages.append(
@@ -155,6 +156,7 @@ class ContextBuilder:
             }
         )
 
+        # 稳定层 + runtime 信号均未变 → 复用缓存（避免每步重扫 prompts/）
         if (
             self._cached_assembly is not None
             and self._cached_assembly.system_fingerprint == system_fingerprint
@@ -208,7 +210,7 @@ class ContextBuilder:
         self._cached_assembly = None
 
     def _load_system_prompt(self) -> str:
-        """加载 L1 系统 prompt"""
+        """加载 Constitution（L1）。--system 可整段覆盖。"""
         if self.system_prompt_override:
             return self.system_prompt_override
         prompt_path = self._resource_root() / "prompts" / "agents_prompts" / "L1_system_prompt.py"
@@ -219,7 +221,12 @@ class ContextBuilder:
         return prompt if isinstance(prompt, str) else ""
 
     def _load_tool_prompts(self) -> str:
-        """加载所有工具的 prompt"""
+        """扫描 tools_prompts/*.py，拼成 Tool Contracts 正文。
+
+        - allowlist：只收录已注册工具，避免「说明书有、注册表没有」
+        - {{available_skills}}：Skill prompt 的动态插槽
+        - MCP / Disabled Tools：能力扩展与熔断提示追加在末尾
+        """
         prompts_dir = self._resource_root() / "prompts" / "tools_prompts"
         prompts: List[str] = []
         allowed_names = None
@@ -267,7 +274,7 @@ class ContextBuilder:
         return Path(self.resource_root or self.project_root)
 
     def _load_code_law(self) -> str:
-        """加载 CODE_LAW.md（基于内容 hash 刷新缓存）"""
+        """加载 Project Rules：code_law.md / CODE_LAW.md（mtime + 内容 hash 缓存）。"""
         for filename in ("code_law.md", "CODE_LAW.md"):
             code_law_path = Path(self.project_root) / filename
             if not code_law_path.exists():
@@ -292,5 +299,5 @@ class ContextBuilder:
         return ""
 
     def _build_runtime_signal_messages(self) -> List[Dict[str, Any]]:
+        # ④ Runtime Signals：走 system，不伪装成 user，避免污染对话轮次语义
         return [{"role": "system", "content": block} for block in self._runtime_system_blocks]
-    

@@ -218,6 +218,8 @@ def run(self, input_text, **kwargs):
 
 真正的逻辑全在 `RuntimeRunner` 里，`CodeAgent` 只是依赖容器，不执行业务逻辑。
 
+`RuntimeRunner.run()` 在进入主循环之前，先执行 `_prepare_run()`——完成输入预处理（`@file` 引用展开）、刷新 Skills 提示词、初始化 trace 日志、把用户消息写入历史。用户输入在这步写入历史之后，才作为 `pending_input` 传给主循环。这部分细节在第 02 篇展开。
+
 然后进入 `_react_loop()`：
 
 ```python

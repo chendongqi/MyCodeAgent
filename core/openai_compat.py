@@ -1,4 +1,9 @@
-"""Small synchronous transport for OpenAI-compatible chat-completions APIs."""
+"""Small synchronous transport for OpenAI-compatible chat-completions APIs.
+
+系列 03：LLM 传输层（无官方 openai SDK）。
+职责只有两件——发 HTTP、把 JSON/SSE 包成可点属性的对象。
+provider 路由与响应归一化在 core/llm.py，不在这里。
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,11 @@ from urllib.request import Request, urlopen
 
 
 class ResponseObject:
-    """Expose JSON response fields through the SDK-shaped attribute interface."""
+    """把 JSON dict 伪装成 SDK 风格对象：response.choices[0].message 可点访问。
+
+    同时提供 model_dump() 还原原始 dict，供 trace / serialize_response 使用。
+    上层 extract_* 因此不关心响应来自制客户端还是官方 SDK。
+    """
 
     def __init__(self, value: dict[str, Any]):
         self._value = value
@@ -25,6 +34,7 @@ class ResponseObject:
 
 
 def _to_object(value: Any) -> Any:
+    # 递归包装：嵌套 dict/list 也变成可点访问，保持与 OpenAI SDK 返回形状一致
     if isinstance(value, dict):
         return ResponseObject(value)
     if isinstance(value, list):
@@ -46,7 +56,11 @@ class _Chat:
 
 
 class OpenAICompatibleClient:
-    """Subset of the official SDK used by ``HelloAgentsLLM`` without extra deps."""
+    """官方 SDK 的最小子集：只实现 harness 用到的 chat.completions.create。
+
+    调用习惯保持 client.chat.completions.create(**request)，
+    底层是标准库 urllib，零第三方依赖，核心路径全部可见。
+    """
 
     def __init__(self, api_key: str, base_url: str, timeout: int):
         self.api_key = api_key
@@ -55,6 +69,7 @@ class OpenAICompatibleClient:
         self.chat = _Chat(self)
 
     def _request(self, payload: dict[str, Any]):
+        # OpenAI 兼容协议：POST {base_url}/chat/completions + Bearer token
         request = Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -79,6 +94,7 @@ class OpenAICompatibleClient:
             return ResponseObject(json.loads(response.read().decode("utf-8")))
 
     def _stream(self, payload: dict[str, Any]):
+        # SSE：每行 data: {...}，data: [DONE] 表示流结束
         with self._request(payload) as response:
             for raw_line in response:
                 line = raw_line.decode("utf-8").strip()

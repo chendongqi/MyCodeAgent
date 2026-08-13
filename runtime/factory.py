@@ -39,6 +39,7 @@ def build_runtime_context(host: Any) -> None:
         host._register_mcp_tools()
 
     host.context_builder = ContextBuilder(
+        # 系列 04：人格组装器挂在这里；每步 build_model_view 取 get_system_messages()
         tool_registry=host.tool_registry,
         project_root=host.project_root,
         resource_root=host.package_resource_root,

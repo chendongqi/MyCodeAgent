@@ -1,4 +1,9 @@
-"""HelloAgents统一LLM接口 - 基于OpenAI原生API"""
+"""HelloAgents统一LLM接口 - 基于OpenAI原生API
+
+系列 03：LLM 适配层。
+两件事：① provider 路由（选端点/key）② 响应归一化（extract_* 五元组）。
+传输细节在 openai_compat.py；ReAct 循环只消费本文件导出的统一字段。
+"""
 
 import json
 import logging
@@ -15,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def response_attr(value: Any, key: str) -> Any:
-    """Read one field from either an OpenAI-compatible object or mapping."""
+    """通用字段读取：dict 走 .get，对象走 getattr。
+
+    ResponseObject（自制）与官方 SDK 的 Pydantic 对象用同一套 extract_* 代码。
+    """
 
     return value.get(key) if isinstance(value, dict) else getattr(value, key, None)
 
@@ -34,12 +42,15 @@ def parse_tool_input(raw: Any) -> tuple[Any, str | None]:
 
 
 def _response_message(response: Any) -> Any:
+    # 所有 extract_* 的公共入口：choices[0].message
     choices = response_attr(response, "choices") or []
     return response_attr(choices[0], "message") if choices else None
 
 
+# ── 响应归一化五元组：loop 只依赖这些函数，不直接解析各家 JSON ──────────────
+
 def extract_response_content(response: Any) -> str | None:
-    """Extract text content from an OpenAI-compatible completion response."""
+    """抽出正文。部分模型把 content 做成多段 list，这里拼成字符串。"""
 
     content = response_attr(_response_message(response), "content")
     if isinstance(content, list):
@@ -50,7 +61,7 @@ def extract_response_content(response: Any) -> str | None:
 
 
 def extract_reasoning_content(response: Any) -> Any:
-    """Extract optional reasoning content without changing provider payloads."""
+    """抽出可选思维链字段（reasoning_content / reasoning），不影响控制流。"""
 
     message = _response_message(response)
     reasoning = response_attr(message, "reasoning_content") or response_attr(message, "reasoning")
@@ -61,7 +72,7 @@ def extract_reasoning_content(response: Any) -> Any:
 
 
 def extract_usage(response: Any) -> dict[str, Any] | None:
-    """Project token usage into the stable runtime shape."""
+    """投影为稳定的 token 用量形状，供 context_engine 记账与预算检查。"""
 
     usage = response_attr(response, "usage")
     if not usage:
@@ -74,7 +85,12 @@ def extract_usage(response: Any) -> dict[str, Any] | None:
 
 
 def extract_tool_calls(response: Any) -> list[dict[str, Any]]:
-    """Normalize modern and legacy OpenAI-compatible tool calls."""
+    """新旧 Function Calling 格式 → 统一 [{id, name, arguments}]。
+
+    新格式：message.tool_calls[]（主流 OpenAI 兼容）
+    旧格式：message.function_call（单次调用，部分国产模型仍在用）
+    loop 的 Acting 分支只认归一化后的列表。
+    """
 
     message = _response_message(response)
     calls = response_attr(message, "tool_calls") or []
@@ -102,7 +118,11 @@ def extract_tool_calls(response: Any) -> list[dict[str, Any]]:
 
 
 def extract_response_meta(response: Any) -> dict[str, Any]:
-    """Return the response facts used for recovery and completion decisions."""
+    """抽出控制流信号（finish_reason / 长度 / refusal），不含正文本身。
+
+    与 extract_response_content 互补：text 给人看，meta 给空响应重试、
+    截断判定、完成门与 trace 用。
+    """
 
     choices = response_attr(response, "choices") or []
     choice = choices[0] if choices else None
@@ -153,6 +173,11 @@ PROVIDER_ALIASES = MappingProxyType(
     }
 )
 
+# 表驱动 provider 路由：加一家模型主要是加一行 profile，而不是改调用链。
+# key_envs     = 按优先级查 API key 的环境变量
+# detect_envs  = 自动探测时看哪些变量（命中多个会报错，要求显式指定）
+# base_url     = 该 provider 的默认端点
+# url_markers  = 从 base_url 字符串反推 provider 的关键词
 PROVIDER_PROFILES = MappingProxyType(
     {
         "openai": MappingProxyType(
@@ -274,14 +299,13 @@ PROVIDER_PROFILES = MappingProxyType(
 
 class HelloAgentsLLM:
     """
-    为HelloAgents定制的LLM客户端。
-    它用于调用任何兼容OpenAI接口的服务，并默认使用流式响应。
+    OpenAI 兼容服务的统一客户端（适配层，不是传输层）。
 
-    设计理念：
-    - 参数优先，环境变量兜底
-    - 流式响应为默认，提供更好的用户体验
-    - 支持多种LLM提供商
-    - 统一的调用接口
+    设计要点：
+    - 参数优先，环境变量兜底；provider 用 PROVIDER_PROFILES 表驱动
+    - 请求侧抹平各家怪癖（temperature / 多 system / tool_choice）
+    - 响应侧由模块级 extract_* 归一化；本类负责把 raw response 拿回来
+    - 主循环用 invoke_raw；invoke/think 给「只要文本」的场景
     """
 
     def __init__(
@@ -318,10 +342,10 @@ class HelloAgentsLLM:
         self.kwargs = kwargs
         self._temperature_policy_notice_emitted = False
 
-        # 自动检测provider或使用指定的provider
+        # provider 解析优先级：显式参数 → LLM_PROVIDER → 自动探测 → "auto"
         self.provider = self._resolve_provider(provider, api_key, base_url)
 
-        # 根据provider确定API密钥和base_url
+        # 按 profile 表解析 key / base_url（各家环境变量名不同）
         self.api_key, resolved_base_url = self._resolve_credentials(api_key, base_url)
         self.base_url = self._normalize_base_url(resolved_base_url)
 
@@ -331,7 +355,7 @@ class HelloAgentsLLM:
         if not all([self.api_key, self.base_url]):
             raise HelloAgentsException("API密钥和服务地址必须被提供或在.env文件中定义。")
 
-        # 创建OpenAI客户端
+        # 传输层客户端（urllib），对外仍是 chat.completions.create 形状
         self._client = self._create_client()
 
     def _get_env(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -506,7 +530,11 @@ class HelloAgentsLLM:
         stream: bool = False,
         **overrides: Any,
     ) -> dict[str, Any]:
-        """Build one normalized OpenAI-compatible completion request."""
+        """组装一次请求：消息归一化 → temperature 约束 → provider 兼容补丁。
+
+        请求侧怪癖（Kimi temperature、MiniMax 多 system 等）集中在这里处理，
+        避免泄漏进 RuntimeRunner。
+        """
         request = {
             "model": self.model,
             "messages": self._normalize_messages_for_provider(messages),
@@ -523,7 +551,11 @@ class HelloAgentsLLM:
         project_response: Callable[[Any], Any] | None = None,
         **overrides: Any,
     ) -> Any:
-        """Make one non-streaming request with the configured retry policy."""
+        """非流式调用 + 瞬时失败重试（网络/HTTP）。
+
+        注意：这与 loop 内层 while 的「语义级」恢复（空响应 / PROMPT_TOO_LONG）
+        不是同一层——这里只处理传输失败。
+        """
         for attempt in range(self.max_retries + 1):
             try:
                 request = self._build_request(messages, **overrides)
@@ -583,18 +615,16 @@ class HelloAgentsLLM:
             raise HelloAgentsException(f"LLM调用失败: {str(e)}")
 
     def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
-        """
-        非流式调用LLM，返回完整响应。
-        适用于不需要流式输出的场景。
-        """
+        """非流式调用，直接返回正文字符串（摘要压缩等「只要一段话」的场景）。"""
         return self._invoke_with_retries(
             messages, lambda response: response.choices[0].message.content, **kwargs
         )
 
     def invoke_raw(self, messages: list[dict[str, str]], **kwargs):
-        """
-        非流式调用LLM，返回原始响应对象。
-        适用于需要查看完整结构的场景。
+        """非流式调用，返回原始响应对象——主循环专用入口。
+
+        RuntimeRunner 拿到 raw 后再用 extract_* 拆出 text / tool_calls / usage / meta。
+        若用 invoke()，这些信号会在取 .content 时丢掉。
         """
         return self._invoke_with_retries(messages, **kwargs)
 

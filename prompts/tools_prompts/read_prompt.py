@@ -1,6 +1,8 @@
 """Read 工具提示词
 
-提供给 LLM 的工具描述，遵循《通用工具响应协议》。
+系列 04：本文件属于 Tool Contracts（自然语言说明书），
+由 ContextBuilder._load_tool_prompts() 拼进 system 消息。
+参数的机器可读 schema 在 Tool.get_parameters() → registry.get_openai_tools()（系列 05）。
 """
 
 read_prompt = """

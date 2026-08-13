@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 
+# 用户说"如果可以的话跑一下测试"——这类软性要求允许跳过验证（UNVERIFIED 而非 FAIL）
 VERIFY_IF_POSSIBLE_PATTERNS = (
     "if possible",
     "if you can",
@@ -17,6 +18,7 @@ VERIFY_IF_POSSIBLE_PATTERNS = (
     "尽量",
 )
 
+# 从用户输入里识别"需要验证"的关键词，如"跑一下测试" → 要求 tests 类型的证据
 VERIFY_REQUIREMENT_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bpytest\b", "tests"),
     (r"\brun\s+(the\s+)?tests?\b", "tests"),
@@ -30,6 +32,8 @@ VERIFY_REQUIREMENT_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"(运行|执行)?构建", "build"),
 )
 
+# 从 Bash 工具的实际执行命令里识别验证行为，用于收集"执行证据"
+# 例如：历史中有 Bash(command="pytest") 就算提供了 tests 类型的证据
 VERIFY_COMMAND_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bpytest\b", "tests"),
     (r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?::[\w-]+)?\b", "tests"),
@@ -41,10 +45,17 @@ VERIFY_COMMAND_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bbuild\b", "build"),
 )
 
+# 会使代码发生变化的工具——Edit 之后已有的验证证据需要作废（"先改了代码再跑测试"才算有效）
 MUTATING_TOOL_NAMES = {"Edit"}
 
 
 class CompletionGateVerdict(str, Enum):
+    """完成门的三种判决结果。
+
+    PASS：满足所有要求，正常退出
+    FAIL：有未完成项（todo / 缺验证证据），注入反馈让模型重来
+    UNVERIFIED：用户说"尽量"，证据缺失但允许跳过，以不确定状态退出
+    """
     PASS = "pass"
     FAIL = "fail"
     UNVERIFIED = "unverified"
@@ -130,7 +141,18 @@ class CompletionVerifier(Protocol):
 
 
 class DeterministicCompletionVerifier:
-    """Phase 2 default verifier; deterministic only, no second agent."""
+    """默认的确定性完成门，纯规则判断，不调用 LLM 或子 agent。
+
+    判断逻辑：
+    1. todo 列表有未完成项 → FAIL
+    2. 用户要求了验证（如"跑测试"）但历史中没有对应的成功 Bash 证据 → FAIL
+    3. 用户说"尽量"且证据缺失 → UNVERIFIED（允许跳过）
+    4. 以上都满足 → PASS
+
+    为什么用确定性规则而不是 LLM 判断：
+    规则判断速度快、结果可预期、不消耗 token，适合作为默认行为。
+    如果需要更智能的判断，可以通过 --enable-verification-agent 启用子 agent 模式。
+    """
 
     def evaluate(
         self,
@@ -143,26 +165,34 @@ class DeterministicCompletionVerifier:
         passed_evidence: list[VerificationEvidence] = []
         pending_unverified = False
 
+        # 检查 1：TodoWrite 记录的任务是否全部完成
         if requirements.has_incomplete_todos:
             reasons.append("incomplete_todos")
 
+        # 检查 2：用户要求的验证步骤是否有对应的执行证据
         if requirements.requires_verification:
             for kind in requirements.verification_kinds:
                 requirement_id = f"verification:{kind}"
+                # 从历史工具执行结果里找匹配的证据
                 relevant = [item for item in evidence if item.requirement_id == requirement_id]
+                # 有效证据：该验证命令执行过且状态为 success，且在最后一次 Edit 之后执行
                 valid = [item for item in relevant if item.valid and item.status == "success"]
                 if valid:
                     passed_evidence.extend(valid)
                     continue
                 if relevant and not valid:
+                    # 找到了执行记录，但失败了或已被 Edit 作废
                     reasons.append(f"verification_invalid:{kind}")
                     continue
                 if requirements.allow_unverified:
+                    # 用户说"尽量"，没有证据但允许跳过
                     pending_unverified = True
                 else:
+                    # 没有任何证据，明确要求了验证 → FAIL
                     reasons.append(f"missing_verification_evidence:{kind}")
 
         if reasons:
+            # 有任何拦截原因 → FAIL，同时生成反馈消息注入给模型
             return CompletionGateResult(
                 verdict=CompletionGateVerdict.FAIL,
                 reasons=tuple(reasons),
@@ -171,12 +201,14 @@ class DeterministicCompletionVerifier:
             )
 
         if pending_unverified:
+            # 所有检查通过，但部分验证缺少证据且用户允许跳过
             return CompletionGateResult(
                 verdict=CompletionGateVerdict.UNVERIFIED,
                 reasons=("verification_unverified",),
                 passed_evidence=tuple(passed_evidence),
             )
 
+        # 所有检查通过
         return CompletionGateResult(
             verdict=CompletionGateVerdict.PASS,
             passed_evidence=tuple(passed_evidence),
@@ -215,15 +247,26 @@ def infer_completion_requirements(
     user_input: str,
     history_messages: list[Any],
 ) -> CompletionRequirements:
+    """从用户输入和历史中推断完成要求。
+
+    两类要求：
+    1. 验证要求：用户说了"跑测试"/"lint" 等关键词，需要对应的执行证据
+    2. todo 完成要求：历史中 TodoWrite 记录了任务，且有未完成项
+
+    为什么在每步完成门检查时都重新推断（而不是只推断一次）：
+    todo 列表会随着对话动态更新，必须每次从最新历史里读取。
+    """
     normalized = (user_input or "").lower()
     explicit_constraints: list[str] = []
     verification_kinds: list[str] = []
+    # 从用户输入识别需要验证的类型（tests / lint / typecheck / build）
     for pattern, kind in VERIFY_REQUIREMENT_PATTERNS:
         if re.search(pattern, normalized):
             if kind not in verification_kinds:
                 verification_kinds.append(kind)
                 explicit_constraints.append(kind)
 
+    # 从历史中找最近一次 TodoWrite 的任务列表，检查是否有未完成项
     latest_todos = _extract_latest_todos(history_messages)
     incomplete_todos = tuple(
         item.get("content", "")
@@ -234,6 +277,7 @@ def infer_completion_requirements(
     return CompletionRequirements(
         requires_verification=bool(verification_kinds),
         verification_kinds=tuple(verification_kinds),
+        # "如果可以"类软性要求：allow_unverified=True，缺证据时返回 UNVERIFIED 而非 FAIL
         allow_unverified=bool(verification_kinds)
         and any(pattern in normalized for pattern in VERIFY_IF_POSSIBLE_PATTERNS),
         has_incomplete_todos=bool(incomplete_todos),
