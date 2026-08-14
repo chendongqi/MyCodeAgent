@@ -183,9 +183,9 @@ def _print_banner(code_law_exists: bool, ui: Optional[EnhancedUI] = None) -> Non
         ui.show_banner()
     else:
         banner_text = r"""
-      /\_/\
-     ( o.o )  [MyCat]
-      > ^ <
+    ,_._,
+   ( O  O )  [OwlCode]
+    (> w <)
         """
         console.print(Text(banner_text, style="banner"))
         console.print("[dim]Developer-first Coding Agent[/dim]")

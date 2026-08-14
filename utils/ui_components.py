@@ -84,9 +84,9 @@ class ModelBanner:
         """Create a stylized banner with model info"""
 
         logo_lines = [
-            "      /\\_/\\",
-            "     ( o.o )  [MyCat]",
-            "      > ^ <",
+            "    ,_._,",
+            "   ( O  O )  [OwlCode]",
+            "    (> w <)",
         ]
 
         logo = Text("\n".join(logo_lines), style="bold bright_blue")
@@ -100,7 +100,7 @@ class ModelBanner:
             dir_display = project_root
 
         info = Table.grid(padding=(0, 1))
-        info.add_row(Text("MyCodeAgent", style="bold white"), Text(version, style="dim"))
+        info.add_row(Text("OwlCode", style="bold white"), Text(version, style="dim"))
         info.add_row(Text(provider.upper(), style="bold cyan"), Text(model, style="bright_white"))
         info.add_row(Text("Workspace", style="dim"), Text(dir_display, style="bold green"))
 
