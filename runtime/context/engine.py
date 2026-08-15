@@ -133,14 +133,35 @@ class ContextEngine:
         step: int = 0,
         trace_logger: Any = None,
     ) -> ModelView:
-        # 系列 04：最终发给模型的顺序 =
-        #   PromptAssembly 的 system 层（人格/工具说明书/项目规则/runtime）
-        # + 可选 session memory（另一条 system，按字符预算裁剪）
-        # + history 投影（user/assistant/tool/...）
+        """组装本 step 发给 LLM 的完整 Model View（系列 04 与 09 的汇合点）。
+
+        最终 messages 顺序（见 learning/blog/code-agent-series-04-prompt-assembly.md）：
+          [system]×N  ← ContextBuilder.get_system_messages()
+                        Constitution / Tool Contracts / Project Rules / Runtime Signals
+          [system]×0-1 ← session memory（跨 run 摘要前馈，不在 PromptAssembly 四层里）
+          [user|assistant|tool|...] ← history 的有界投影 + OpenAI 格式规范化
+
+        注意：tools= JSON schema 不在这里，由 loop 单独传给 llm.invoke_raw(tools=...)。
+        """
+        # ── 1. History 有界投影（系列 09，与 prompt 分层正交）────────────────
+        # source：HistoryManager 的 append-only 全量事实，永不因压缩而删除
         source_messages = history_manager.get_messages()
+        # project：读时投影；有 compact checkpoint 时 → [summary] + 最近 N 轮
         projection = self.projection_builder.project(source_messages)
+        # normalize：Message → OpenAI dict（assistant 补 tool_calls、summary → system 等）
         history_messages = self.normalizer.normalize(projection.messages)
+
+        # ── 2. System 层：agent「人格 + 能力说明书 + 项目规则」（系列 04）──────
+        # 来自 runtime/prompt_builder.py ContextBuilder.get_prompt_assembly()：
+        #   [0] Constitution     L1_system_prompt.py（或 --system 整段替换）
+        #   [1] Tool Contracts   prompts/tools_prompts/*.py + Skills/MCP/熔断插槽
+        #   [2] Project Rules    code_law.md（可选）
+        #   [3+] Runtime Signals set_runtime_system_blocks() 注入的可变通知
+        # 稳定三层按 fingerprint 缓存；Skills/MCP/runtime 变更时 setter 清空缓存
         system_messages = self.context_builder.get_system_messages()
+
+        # ── 3. 动态 system：Session Memory（系列 10 前馈，按字符预算裁剪）──────
+        # 与 PromptAssembly 分层存放：是 transcript 衍生的跨轮摘要，不是人设文件
         dynamic_messages: list[dict[str, Any]] = []
         session_memory_chars = 0
         session_memory_message_count = 0
@@ -152,12 +173,20 @@ class ContextEngine:
                 dynamic_messages.append({"role": "system", "content": rendered})
                 session_memory_message_count = 1
                 dynamic_sources.append("session_memory")
+
+        # ── 4. 拼接：system 在前，history 在后（Message List，非 scratchpad）──
+        # 典型头部：[Constitution][Tool Contracts][CODE_LAW][Session Memory?][user...]
         messages = list(system_messages) + dynamic_messages + list(history_messages)
 
+        # ── 5. 体量估算（供 compaction 决策与 trace，非精确 token 计数）────────
+        # pending_input 已在 _prepare_run 写入 history；此处计入是为首步预算估算
         estimated_chars = len(pending_input or "")
         for message in messages:
             estimated_chars += len(str(message.get("content", "")))
 
+        # ── 6. 封装 ModelView：messages + 可观测元数据 ─────────────────────────
+        # source_message_count vs history_message_count：压缩前后条数对比（trace 用）
+        # projection_mode：full_history | compact_checkpoint
         view = ModelView(
             messages=messages,
             system_message_count=len(system_messages),
@@ -173,6 +202,8 @@ class ContextEngine:
             dynamic_context_sources=tuple(dynamic_sources),
         )
 
+        # trace 事件 model_view_build：调试「这轮模型看到了什么」
+        # 配合 trace_model_request_state 的 prompt fingerprint，可对比 prompt 漂移
         if trace_logger:
             trace_logger.log_event(
                 "model_view_build",
