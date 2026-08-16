@@ -25,15 +25,24 @@ class ToolExecutor:
         )
 
     def execute(self, name: str, input_text: Any, *, trace_logger=None, step: int = 0) -> ToolResult:
+        """执行管道：权限检查 → 乐观锁注入 → 熔断检查 → tool.run()
+
+        管道各关卡有顺序依赖：先检权限，再注入乐观锁参数，再检熔断，最后执行。
+        任一关卡失败立即短路返回 ToolResult(status=ERROR)，不会继续往下走。
+        """
         parameters = self.registry.prepare_parameters(input_text)
 
+        # 关卡 1：权限检查（ALLOW / DENY / ASK），fail-closed：未知工具默认 DENY
         permission_payload = self._decide_permission(name, parameters, trace_logger=trace_logger, step=step)
         if permission_payload is not None:
             return permission_payload
 
+        # 关卡 2：Edit 工具自动注入乐观锁参数（从 Read 缓存取 mtime/size）
+        # 若模型未提供 expected_mtime_ms，框架自动补全；冲突时 Edit 返回 CONFLICT
         if name == "Edit":
             parameters = self.registry.inject_optimistic_lock_params(name, parameters)
 
+        # 关卡 3：熔断检查（连续失败 N 次后工具临时禁用）
         if not self.registry.is_available(name):
             return self.registry.create_circuit_open_result(name, parameters)
 
@@ -69,8 +78,10 @@ class ToolExecutor:
                 params_input={},
             )
 
+        # 关卡 4 后处理：更新熔断器状态；Read 结果缓存进乐观锁 store
         self.registry.record_execution_result(name, result_payload)
         if name == "Read":
+            # 缓存 mtime + size，供下一次 Edit 自动注入乐观锁参数
             self.registry.cache_read_result(result_payload, parameters)
 
         return result_payload

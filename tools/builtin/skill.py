@@ -70,6 +70,7 @@ class SkillTool(Tool):
         refresh = self._refresh_on_call
         skill_meta = self._skill_loader.get_skill(name.strip(), refresh=refresh)
         if not skill_meta and not refresh:
+            # 缓存里找不到，尝试刷新一次（处理 skill 文件新增但缓存未更新的情况）
             skill_meta = self._skill_loader.get_skill(name.strip(), refresh=True)
         if not skill_meta:
             return self.error_result(
@@ -130,11 +131,18 @@ class SkillTool(Tool):
 
 
 def _apply_arguments(body: str, args: str) -> str:
+    """把用户传入的 args 填入 Skill 正文。
+
+    三种情况：
+    1. body 包含 $ARGUMENTS → 替换占位符到指定位置（精确控制位置）
+    2. 有 args 但 body 没有占位符 → 追加到末尾（兼容没有写占位符的旧 Skill）
+    3. 没有 args → 原样返回
+    """
     trimmed_args = args.strip()
     if "$ARGUMENTS" in body:
-        return body.replace("$ARGUMENTS", trimmed_args)
+        return body.replace("$ARGUMENTS", trimmed_args)   # 有占位符 → 定点替换
     if trimmed_args:
-        return f"{body}\n\nARGUMENTS: {trimmed_args}"
+        return f"{body}\n\nARGUMENTS: {trimmed_args}"     # 无占位符 → 追加到末尾
     return body
 
 

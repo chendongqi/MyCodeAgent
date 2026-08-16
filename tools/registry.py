@@ -108,12 +108,16 @@ class ToolRegistry:
         """
         构建 OpenAI function calling 所需的 tools 列表。
 
+        被熔断的工具不出现在输出里——既阻止执行，也让模型看不到 schema，
+        避免模型不断尝试已失效的工具。
+
         Returns:
             list of {"type": "function", "function": {name, description, parameters}}
         """
         tools: list[dict[str, Any]] = []
 
         for tool in sorted(self._tools.values(), key=lambda item: item.name):
+            # 熔断双重保护：失败工具从 schema 里消失，模型不会再调它
             if not self._circuit_breaker.is_available(tool.name):
                 continue
             try:
@@ -159,7 +163,9 @@ class ToolRegistry:
     @staticmethod
     def _parameters_to_schema(params: list[ToolParameter]) -> dict[str, Any]:
         """
-        将 ToolParameter 列表转换为 JSON Schema。
+        将 ToolParameter 列表转换为 OpenAI 兼容的 JSON Schema。
+
+        注意：array 类型必须附带 items 字段，否则 OpenAI API 会拒绝请求。
         """
         if not isinstance(params, (list, tuple)):
             params = []
@@ -288,8 +294,13 @@ class ToolRegistry:
     
     def _inject_optimistic_lock_params(self, tool_name: str, parameters: dict) -> dict:
         """
-        为 Edit 工具自动注入乐观锁参数
-        
+        为 Edit 工具自动注入乐观锁参数。
+
+        工作原理：Read 成功后缓存文件 mtime + size（见 _cache_read_meta）。
+        Edit 执行前，若模型未提供 expected_mtime_ms，框架从缓存自动补全。
+        Edit 内部会比对当前 mtime/size 与期望值，若文件在 Read 之后被修改则返回 CONFLICT，
+        而不是静默覆盖——这防止了并发/外部修改导致的数据丢失。
+
         如果参数中缺少 expected_mtime_ms / expected_size_bytes，
         尝试从 Read 缓存中查找并注入。
         

@@ -194,12 +194,16 @@ class ContextBuilder:
         self._cached_assembly = None
 
     def set_skills_prompt(self, prompt: str) -> None:
-        """更新 Skills 提示，并清空 system cache。"""
+        """更新 Skills 提示，并清空 system cache。
+
+        Skills 列表变化时（新增/删除/修改 SKILL.md 后触发 refresh），
+        调用此方法让下一轮 get_prompt_assembly() 重新构建系统提示词。
+        """
         normalized = prompt or ""
         if normalized == self._skills_prompt:
             return
         self._skills_prompt = normalized
-        self._cached_assembly = None
+        self._cached_assembly = None  # 清空缓存，强制下次重新组装
 
     def set_runtime_system_blocks(self, blocks: List[str]) -> None:
         """设置 runtime 通知块（注入 system，不污染 user 轮次）。"""
@@ -224,7 +228,8 @@ class ContextBuilder:
         """扫描 tools_prompts/*.py，拼成 Tool Contracts 正文。
 
         - allowlist：只收录已注册工具，避免「说明书有、注册表没有」
-        - {{available_skills}}：Skill prompt 的动态插槽
+        - {{available_skills}}：Skill prompt 的动态插槽，替换为实际 Skill 列表文本
+          格式：- skill-name: description（由 format_skills_for_prompt() 生成）
         - MCP / Disabled Tools：能力扩展与熔断提示追加在末尾
         """
         prompts_dir = self._resource_root() / "prompts" / "tools_prompts"
@@ -252,6 +257,8 @@ class ContextBuilder:
                                 continue
                         prompt_value = value.strip()
                         if self._skills_prompt and "{{available_skills}}" in prompt_value:
+                            # 把 skill_prompt.py 里的 {{available_skills}} 替换为实际 Skill 列表文本
+                            # 效果：模型的系统提示词里看到 "- code-review: ..." 这样的可用 Skill 列表
                             prompt_value = prompt_value.replace("{{available_skills}}", self._skills_prompt)
                         prompts.append(prompt_value)
         if self._mcp_tools_prompt:

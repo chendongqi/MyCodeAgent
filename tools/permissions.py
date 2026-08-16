@@ -57,7 +57,17 @@ class PermissionDecision:
 
 
 class RiskClassifier:
-    """Classify tool calls into permission decisions."""
+    """Classify tool calls into permission decisions.
+
+    MVP 策略路由（不是 OS 沙箱）：防止模型被诱导执行危险命令。
+    策略：fail-closed——未知工具默认 DENY，宁可不可用，不能悄悄执行危险操作。
+
+    决策优先级：
+    1. 只读工具 → ALLOW
+    2. 写工具 → 检查 runtime_mode（只读子 agent → DENY）
+    3. Bash → 正则黑名单（sudo/rm/嵌套shell → DENY）→ 灰名单（ASK）→ 白名单（ALLOW）
+    4. 未知工具 → DENY
+    """
 
     READ_ONLY_TOOLS = {"Read", "Grep", "Glob"}
     WRITE_TOOLS = {"Edit"}

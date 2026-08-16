@@ -24,7 +24,14 @@ class ToolFailureRecord:
 
 
 class CircuitBreaker:
-    """Per-tool failure tracker with simple open/half-open recovery."""
+    """Per-tool failure tracker with simple open/half-open recovery.
+
+    三态流转：
+    CLOSED  → 正常可用，每次失败 failure_count++
+    OPEN    → failure_count >= threshold，工具禁用，同时从 function schema 里移除
+    HALF_OPEN → 冷却期（recovery_timeout 秒）结束后放行一次试探：
+               成功 → CLOSED；失败 → OPEN（重置计时）
+    """
 
     def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 300):
         self.failure_threshold = max(1, int(failure_threshold))

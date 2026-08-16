@@ -25,13 +25,14 @@ def build_runtime_context(host: Any) -> None:
 
     host._skills_prompt = ""
     if host.enable_skills and _project_has_skill_files(host.project_root):
+        # skills/ 目录存在且有 SKILL.md 文件 → 创建 SkillLoader 并做首次扫描
         from extensions.skills import SkillLoader
 
         host._skill_loader = SkillLoader(host.project_root)
     else:
-        host._skill_loader = None
-    host._refresh_skills_prompt()
-    host._register_builtin_tools()
+        host._skill_loader = None  # 无 Skills → SkillTool 不会被注册
+    host._refresh_skills_prompt()  # 首次扫描并生成 skills 列表文本
+    host._register_builtin_tools() # 注册内置工具
 
     host._mcp_clients = []
     host._mcp_tools_prompt = ""
@@ -101,6 +102,10 @@ def create_subagent_launcher(host: Any) -> SubagentLauncher:
 
 
 def _project_has_skill_files(project_root: str) -> bool:
+    """快速检查：skills/ 目录是否存在且包含至少一个 SKILL.md 文件。
+
+    用于决定是否创建 SkillLoader。next(..., None) 只检查有没有，不全量扫描。
+    """
     skills_dir = Path(project_root) / "skills"
     return skills_dir.is_dir() and next(skills_dir.rglob("SKILL.md"), None) is not None
 

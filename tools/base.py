@@ -60,6 +60,11 @@ class ToolResult:
     Tools keep structured data and execution metadata in Python until the
     orchestrator writes a model tool message.  The familiar JSON envelope is
     deliberately a boundary representation, not an internal transport type.
+
+    设计原则：
+    - frozen=True：不可变对象，管道流转中不会被意外修改
+    - 内部传输用 Python 对象，序列化（serialize_tool_result）只在写入 history 时发生
+    - JSON 信封格式见 tool_result_payload()，顶层字段严格限定
     """
 
     status: ToolStatus
@@ -73,7 +78,11 @@ class ToolResult:
 
 
 def tool_result_payload(result: ToolResult) -> Dict[str, Any]:
-    """Build the one model-facing tool-observation envelope."""
+    """Build the one model-facing tool-observation envelope.
+
+    模型边界序列化：ToolResult（内部对象）→ JSON 可序列化的 dict。
+    error 字段仅在 status=error 时添加，避免模型对成功结果产生误判。
+    """
 
     payload: Dict[str, Any] = {
         "status": result.status.value,
