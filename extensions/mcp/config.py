@@ -1,4 +1,9 @@
-"""MCP configuration loader."""
+"""MCP configuration loader.
+
+系列 07：外部 server 清单从哪来。
+优先级：环境变量 MCP_SERVERS → 项目根 mcp_servers.json / .mcp.json / mcp.json。
+兼容 Claude 的 {"mcpServers": {...}} 包一层写法。
+"""
 
 from __future__ import annotations
 
@@ -53,4 +58,5 @@ def load_mcp_servers(project_root: str) -> dict[str, Any]:
 
 
 def connect_mode() -> str:
+    # startup = 启动时连接并发现工具；disabled = 配置在但不连
     return os.environ.get("MCP_CONNECT_MODE", "startup").lower()

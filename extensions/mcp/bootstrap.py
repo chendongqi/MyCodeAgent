@@ -1,4 +1,8 @@
-"""Register MCP servers and tools in ToolRegistry."""
+"""Register MCP servers and tools in ToolRegistry.
+
+系列 07：MCP 组装入口。默认不走这里——ENABLE_MCP / --enable-mcp 打开后，
+才懒加载 SDK、读配置、为每个 server 建 Client，并把远端工具 Adapter 进 Registry。
+"""
 
 from __future__ import annotations
 
@@ -17,7 +21,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 def _load_mcp_runtime() -> tuple[type[Any], type[Any], Any]:
-    """Load the MCP SDK boundary only after the user explicitly enables MCP."""
+    """Load the MCP SDK boundary only after the user explicitly enables MCP.
+
+    client/adapter 会 import 官方 mcp 包。核心安装不含这个 extra，
+    所以必须拖到「用户显式开启」之后，避免没装 SDK 时连主循环都起不来。
+    """
     try:
         from extensions.mcp.adapter import register_mcp_tools
         from extensions.mcp.client import MCPClient, MCPClientConfig
@@ -73,8 +81,30 @@ def _build_client_config(project_root: str, spec: dict[str, Any], client_config_
 
 
 def register_mcp_servers(tool_registry, project_root: str) -> tuple[list[MCPClient], list[dict[str, object | None]]]:
+    """MCP 组装主入口：配置 → Client → 工具发现 → 注册到 ToolRegistry。
+
+    整体流程：
+    1. load_mcp_servers    读配置（JSON 文件 / 环境变量）拿到 server 清单
+    2. connect_mode        决定连接策略（startup 立即连 / disabled 跳过）
+    3. _build_client_config 为每个 server 构造 MCPClientConfig（stdio or http）
+    4. MCPClient(config)   创建 client 对象，但尚未连接
+    5. register_mcp_tools  连接 server、调 list_tools、把每个远端工具包成 Adapter 注入 Registry
+
+    单个 server 失败只记 warning，不影响其他 server 和主循环启动。
+    返回值：(clients 列表, 已注册工具的元信息列表)
+    clients 由 host 持有，session 结束时调 client.close_sync() 释放连接。
+    """
+    # 懒加载 MCP SDK（核心安装不含 mcp 包，只有用户显式开启后才 import）
     MCPClient, MCPClientConfig, register_mcp_tools = _load_mcp_runtime()
+
+    # load_mcp_servers：优先读环境变量 MCP_SERVERS（JSON 字符串），
+    # 其次按顺序查找 mcp_servers.json / .mcp.json / mcp.json，
+    # 兼容 {"mcpServers": {...}} 的 Claude 桌面端写法
     servers = load_mcp_servers(project_root)
+
+    # connect_mode：读环境变量 MCP_CONNECT_MODE，默认 "startup"
+    # "startup" → 启动时立即连接并发现工具
+    # "disabled" → 配置文件存在但不连接（调试用）
     mode = connect_mode()
     if not servers or mode == "disabled":
         return [], []
@@ -85,6 +115,12 @@ def register_mcp_servers(tool_registry, project_root: str) -> tuple[list[MCPClie
     for server_name, spec in servers.items():
         if not isinstance(spec, dict):
             continue
+
+        # _build_client_config：把 JSON spec 转成 MCPClientConfig
+        # 两种 transport：
+        #   http  → spec 里有 url/endpoint，适合远程 HTTP server
+        #   stdio → spec 里有 command（如 "uvx"/"node"），适合本地子进程
+        # uvx/uv 命令额外注入缓存目录环境变量，防止子进程污染系统全局缓存
         config = _build_client_config(project_root, spec, MCPClientConfig)
         client = MCPClient(config)
         clients.append(client)
@@ -93,6 +129,12 @@ def register_mcp_servers(tool_registry, project_root: str) -> tuple[list[MCPClie
             continue
 
         try:
+            # register_mcp_tools：连接 server → list_tools_sync → 为每个工具创建 MCPToolAdapter
+            # MCPToolAdapter 把远端工具伪装成本地 Tool 对象：
+            #   - get_parameters() 从 inputSchema 生成参数定义
+            #   - run() 调 client.call_tool_sync() 发请求，把结果包成标准信封
+            # 公开名 = sanitize(server_name:remote_name)，避免两个 server 都有 "search" 工具时冲突
+            # 注册后和内置 Read/Bash 走同一套 Registry / Orchestrator / Executor 管道
             tools_meta = register_mcp_tools(tool_registry, client, namespace=server_name)
             registered_tools.extend(tools_meta)
         except Exception as exc:

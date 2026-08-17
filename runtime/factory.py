@@ -36,6 +36,7 @@ def build_runtime_context(host: Any) -> None:
 
     host._mcp_clients = []
     host._mcp_tools_prompt = ""
+    # 系列 07：MCP 默认关。打开后才连外部 server，把 Adapter 注册进已有 Registry。
     if host.enable_mcp:
         host._register_mcp_tools()
 

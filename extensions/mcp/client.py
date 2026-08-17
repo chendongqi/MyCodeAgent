@@ -28,7 +28,12 @@ class MCPClientConfig:
 
 
 class MCPClient:
-    """Async MCP client with lazy connection management."""
+    """Async MCP client with lazy connection management.
+
+    系列 07：官方 SDK 是 async，Tool.run 是 sync。
+    本类自养一条 event loop，用 _run_sync 把 list_tools / call_tool 堵成同步调用。
+    第一次真正用到才 connect()；对端断开则 close 后重连一次。
+    """
 
     def __init__(self, config: MCPClientConfig):
         self._config = config

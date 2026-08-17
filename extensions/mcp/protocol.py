@@ -1,4 +1,8 @@
-"""Convert MCP tool results to the Universal Tool Response Protocol."""
+"""Convert MCP tool results to the Universal Tool Response Protocol.
+
+系列 07：MCP content 块（text / resource / 二进制）→ {status, data, text, error, stats, context}。
+模型看到的信封和第 05 篇内置工具相同，不需要知道对面是另一个进程。
+"""
 
 from __future__ import annotations
 

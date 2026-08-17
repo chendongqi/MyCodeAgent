@@ -1,4 +1,10 @@
-"""Adapters for MCP tools to ToolRegistry."""
+"""Adapters for MCP tools to ToolRegistry.
+
+系列 07：把远端 MCP 工具伪装成本地 Tool。
+公开名带 server 命名空间；inputSchema → get_parameters()；
+run() 只做「校验 → call_tool_sync → 收成通用信封」。
+之后和 Read/Bash 走同一条 Registry / Orchestrator / Executor 管道。
+"""
 
 from __future__ import annotations
 
@@ -139,7 +145,11 @@ class MCPToolAdapter(Tool):
 
 
 def register_mcp_tools(tool_registry, mcp_client, namespace: str | None = None) -> list[dict[str, object | None]]:
-    """Discover tools from MCP server and register them to ToolRegistry."""
+    """Discover tools from MCP server and register them to ToolRegistry.
+
+    公开名 = sanitize(namespace:remote_name)，避免两家都叫 search，
+    也避免冒号等字符进不了 Function Calling 的 name 约束。
+    """
     logger = logging.getLogger(__name__)
     safe_name_pattern = re.compile(r"[^a-zA-Z0-9_-]")
 

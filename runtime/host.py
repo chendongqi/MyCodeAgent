@@ -202,7 +202,12 @@ class CodeAgent:
         self._skills_prompt = format_skills_for_prompt(self._skill_loader.list_skills(refresh=False), budget)
 
     def _register_mcp_tools(self) -> None:
-        """可选：注册 MCP 工具（基于 MCP_SERVERS 配置）"""
+        """可选：注册 MCP 工具（基于 MCP_SERVERS / mcp.json 配置）。
+
+        系列 07：成功后 tools_meta 会变成 Tool Contracts 里的 ## MCP Tools；
+        clients 保存在 self._mcp_clients，close() 时逐个 close_sync。
+        SDK 没装 → MCPExtraRequiredError 向上抛；单个 server 失败只 warning。
+        """
         try:
             from extensions.mcp.bootstrap import MCPExtraRequiredError, register_mcp_servers
             from extensions.mcp.prompt import format_mcp_tools_prompt

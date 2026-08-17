@@ -187,6 +187,8 @@ class RiskClassifier:
                 input_summary=summary,
             )
 
+        # 系列 07：未知工具名（含动态 MCP 名）fail-closed。
+        # 进了 Registry 只代表模型「能看见」；执行权仍要过这道门。
         return PermissionDecision(
             action=PermissionAction.DENY,
             risk=RiskLevel.UNKNOWN,

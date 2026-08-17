@@ -262,6 +262,8 @@ class ContextBuilder:
                             prompt_value = prompt_value.replace("{{available_skills}}", self._skills_prompt)
                         prompts.append(prompt_value)
         if self._mcp_tools_prompt:
+            # 系列 07：MCP 走两条通道——这里是自然语言说明书；
+            # schema 已随 Adapter 进 Registry，由 get_openai_tools() 发给模型。
             prompts.append(f"## MCP Tools\n{self._mcp_tools_prompt}")
         # 追加被熔断禁用的工具提示（避免无效调用）
         disabled_tools = []
