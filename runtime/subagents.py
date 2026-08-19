@@ -98,14 +98,14 @@ class RuntimeProfile:
 EXPLORE_PROFILE = RuntimeProfile(
     name="explore",
     system_prompt=EXPLORE_SYSTEM_PROMPT,
-    tool_allowlist=READONLY_TOOLS,
-    max_steps=12,
-    context_token_budget=16_000,
-    total_token_budget=32_000,
-    model_choice="light",
+    tool_allowlist=READONLY_TOOLS,   # 只能用 Read/Grep/Glob，不能写文件、不能执行命令
+    max_steps=12,                    # 最多 12 步，防止无限循环
+    context_token_budget=16_000,     # 单次上下文窗口上限（远小于主 agent 的 128k）
+    total_token_budget=32_000,       # 整轮累计 token 上限，超出强制终止
+    model_choice="light",            # 默认用轻量模型，降低成本
     context_source_policy="self_contained_task_and_structured_context",
     completion_policy="structured_result",
-    result_contract="ExploreResult",
+    result_contract="ExploreResult", # 子 agent 必须返回符合此合约的 JSON
 )
 
 VERIFICATION_PROFILE = RuntimeProfile(
@@ -115,7 +115,7 @@ VERIFICATION_PROFILE = RuntimeProfile(
     max_steps=10,
     context_token_budget=20_000,
     total_token_budget=40_000,
-    model_choice="main",
+    model_choice="main",             # 验证任务用主模型，需要更强的判断能力
     context_source_policy="completion_candidate_requirements_evidence",
     completion_policy="structured_result",
     result_contract="VerificationResult",
@@ -268,41 +268,63 @@ class _SubagentRuntimeHost:
         project_root: Path,
         trace_logger: Any,
     ):
+        # _SubagentRuntimeHost 是子 agent 的独立沙箱，结构和主 agent 的 CodeAgent 完全对齐，
+        # 但所有状态全部新建，不继承主 agent 的任何运行时对象。
+        # RuntimeRunner 只依赖 host 上的属性，通过这种鸭子类型共用同一套循环逻辑：
+        # 只要 host 有 llm/tool_registry/history_manager/context_engine 等属性，
+        # RuntimeRunner 就能在上面跑，不需要继承任何基类。
+
         self.profile = profile
         self.llm = llm
         self.tool_registry = registry
         self.project_root = str(project_root)
+
+        # 从环境变量加载基础配置，再用 profile 的预算覆盖关键字段：
+        # context_window 限制为 profile.context_token_budget（远小于主 agent 的 128k），
+        # 防止子 agent 因探索步骤太多而消耗过多 token
         self.config = Config.from_env().model_copy(
             update={
                 "context_window": profile.context_token_budget,
-                "show_react_steps": False,
+                "show_react_steps": False,  # 子 agent 不输出 ReAct 步骤到控制台
                 "show_progress": False,
             }
         )
-        self.max_steps = profile.max_steps
-        self.max_total_tokens = profile.total_token_budget
+        self.max_steps = profile.max_steps         # 硬性步数上限（explore=12）
+        self.max_total_tokens = profile.total_token_budget  # 硬性 token 上限，超出强制终止
         self.console_progress = False
         self.console_verbose = False
         self.logger = logging.getLogger(f"runtime.subagent.{profile.name}")
         self.last_response_raw = None
-        self._skills_prompt = ""
+        self._skills_prompt = ""   # 子 agent 不加载 Skills
         self._run_id = 0
         self._active_transcript_run_id = None
         self._system_messages_logged = False
+
+        # 独立的历史管理器，从空白开始，主 agent 的历史不会流入子 agent
         self.history_manager = HistoryManager(config=self.config)
+
+        # 系统提示词固定为 profile.system_prompt（要求返回 JSON），
+        # 不加载 MCP 工具提示词和 Skills——子 agent 只需要知道白名单工具的用法
         self.context_builder = ContextBuilder(
             tool_registry=registry,
             project_root=self.project_root,
             system_prompt_override=profile.system_prompt,
             mcp_tools_prompt="",
             skills_prompt="",
-            tool_prompt_allowlist=profile.tool_allowlist,
+            tool_prompt_allowlist=profile.tool_allowlist,  # 只暴露白名单工具的 schema
         )
+
+        # 上下文引擎：用 _summarize_child_messages 做压缩（不启 LLM，纯截断拼接）
+        # 为什么不用主 agent 那套 LLM 压缩？子 agent 预算小，启 LLM 压缩消耗太大，
+        # 简单截断足够，因为子 agent 任务是探索，不需要保留很长的对话历史
         self.context_engine = ContextEngine(
             self.context_builder,
             config=self.config,
             summary_generator=_summarize_child_messages,
         )
+
+        # 独立的 trace 日志和 transcript，session_id 以 "subagent-" 开头，
+        # 写到独立的 JSONL 文件，与主 agent trace 分离但通过 parent_session_id 关联
         self.trace_logger = trace_logger
         transcript_session = f"subagent-{trace_logger.session_id}"
         transcript_path = project_root / "memory" / "transcripts" / f"transcript-{transcript_session}.jsonl"
@@ -313,6 +335,10 @@ class _SubagentRuntimeHost:
             self.transcript_store,
             on_recorded=self.session_memory_manager.ingest_event,
         )
+
+        # 权限模式锁定为 readonly_subagent：
+        # RiskClassifier 在此模式下会对 Edit/Bash/Task 直接返回 DENY，
+        # 即使这些工具意外出现在 registry 里也无法执行——双重保障（白名单 + 权限门）
         permission_context = PermissionContext(runtime_mode="readonly_subagent")
         self.tool_executor = ToolExecutor(
             registry,
@@ -323,6 +349,9 @@ class _SubagentRuntimeHost:
             ),
         )
         self.tool_orchestrator = ToolOrchestrator(self)
+
+        # 子 agent 专用的完成门：检查输出是否符合 result_contract（ExploreResult JSON），
+        # 不符合则触发 FAIL 反馈让子 agent 重输，而不是直接终止
         self.completion_verifier = _StructuredResultCompletionVerifier(profile)
 
     def _apply_session_memory(self, memory: SessionMemory) -> None:
@@ -374,48 +403,91 @@ class SubagentLauncher:
         return filtered
 
     def launch(self, request: SubagentRequest) -> SubagentLaunchResult:
+        """子 agent 的完整执行入口。整个过程同步阻塞，子 agent 跑完才返回。
+
+        执行步骤：
+        1. 根据 profile_name 查找 RuntimeProfile（决定工具白名单、预算、模型）
+        2. 选择 LLM（light 优先，没配则回退到 main）
+        3. 创建独立 trace 日志（child_trace），和主 agent 的 trace 分开写
+        4. 向父 trace 发射 subagent_requested / subagent_started 事件（供观测）
+        5. 创建 _SubagentRuntimeHost（独立沙箱：history/context/tool 全新创建）
+        6. 用 _render_request 把任务文本 + 结构化上下文拼成 prompt
+        7. RuntimeRunner(host).run(prompt) ← 和主 agent 完全相同的 ReAct 循环
+        8. 从 child_trace.events 里提取 terminal_reason/tool_usage/token_usage
+        9. 把 raw_result（子 agent 最后输出的 JSON 字符串）解析成结构化对象
+        10. 返回 SubagentLaunchResult，TaskTool 拿到后打包成标准信封
+        """
         started = time.monotonic()
+
+        # 步骤 1：查找 profile（explore 或 verification），不存在则报错
+        # profile 里定义了这次子任务能用哪些工具、跑多少步、花多少 token
         profile = RUNTIME_PROFILES.get(request.profile_name)
         if profile is None:
             raise ValueError(f"unsupported runtime profile: {request.profile_name}")
+
+        # 步骤 2：选模型
+        # request.model_choice 优先（TaskTool 传入的 "light"/"main"），
+        # 没传则用 profile 的默认值（explore 默认 "light"）
         requested_model = request.model_choice or profile.model_choice
         if requested_model not in {"main", "light"}:
             raise ValueError(f"unsupported subagent model choice: {requested_model}")
         llm, model_choice = self._select_llm(requested_model)
+
+        # 步骤 3：创建子 trace（独立 JSONL 文件，session_id 以 "child-" 开头）
+        # 为什么独立？子 agent 的探索步骤不应混进主 agent 的 trace，
+        # 但两者通过 parent_session_id 关联，可以跨文件追踪父子关系
         child_trace = self._create_child_trace()
         child_session_id = child_trace.session_id
         child_run_id = "run-1"
+
+        # 步骤 4：向父 trace 发射事件，让主 agent 的 trace 里能看到"我启动了一个子任务"
         self._parent_event(
             "subagent_requested",
-            request,
-            profile,
-            child_session_id=child_session_id,
-            child_run_id=child_run_id,
-            model=model_choice,
+            request, profile,
+            child_session_id=child_session_id, child_run_id=child_run_id, model=model_choice,
         )
         self._parent_event(
             "subagent_started",
-            request,
-            profile,
-            child_session_id=child_session_id,
-            child_run_id=child_run_id,
-            model=model_choice,
+            request, profile,
+            child_session_id=child_session_id, child_run_id=child_run_id, model=model_choice,
         )
         try:
+            # 步骤 5：创建子 agent 的独立沙箱
+            # _SubagentRuntimeHost 和主 agent 的 CodeAgent 结构相同，
+            # 但所有状态（history/context/tool_registry/transcript）全部新建，
+            # 完全隔离，不共享主 agent 的任何运行时状态
             host = _SubagentRuntimeHost(
                 profile=profile,
                 llm=llm,
-                registry=self.build_registry(profile),
+                registry=self.build_registry(profile),  # 只含白名单工具的过滤后 registry
                 project_root=self.project_root,
                 trace_logger=child_trace,
             )
+
+            # 步骤 6：把任务描述和结构化上下文拼成 prompt
+            # _render_request 输出：task 文本 + "\n\nStructured context:\n" + JSON
+            # 这是子 agent 唯一能看到的上下文——它看不到主 agent 的历史
             prompt = _render_request(request)
+
+            # 步骤 7：用和主 agent 完全相同的 RuntimeRunner 跑 ReAct 循环
+            # 子 agent 的系统提示词要求它最终输出一个 JSON 对象（不能有 Markdown 代码块）
+            # raw_result 就是子 agent 最后 return 的字符串（JSON 格式）
             raw_result = RuntimeRunner(host).run(prompt)
+
+            # 步骤 8：从 child_trace 里统计执行指标
+            # terminal_reason：子 agent 怎么结束的（completed/max_steps/token_budget 等）
+            # tool_usage：每个工具调用了几次（用于统计和计费）
+            # token_usage：子 agent 累计消耗的 token 数
             terminal_reason, tool_usage, token_usage = _child_metrics(child_trace.events)
             if terminal_reason == "unknown" and raw_result:
                 terminal_reason = "completed"
+            # 子 agent 必须正常完成——其他终止原因（max_steps/token_budget等）都当失败
             if terminal_reason not in {"completed", "completed_unverified"}:
                 raise ValueError(f"child terminal reason: {terminal_reason}")
+
+            # 步骤 9：解析 JSON 结果
+            # ExploreResult.from_json / VerificationResult.from_json 严格校验格式，
+            # 不合法（缺字段、status 值错误、带 Markdown fence 等）直接抛异常
             if profile.result_contract == "ExploreResult":
                 structured = ExploreResult.from_json(
                     raw_result,
@@ -433,6 +505,8 @@ class SubagentLauncher:
                     tool_usage=tool_usage,
                     token_usage=token_usage,
                 )
+                # VerificationVerdict → SubagentStatus 的映射：
+                # PASS → COMPLETED，UNVERIFIED → UNVERIFIED，FAIL/PARTIAL → PARTIAL
                 status = (
                     SubagentStatus.COMPLETED
                     if structured.verdict is VerificationVerdict.PASS

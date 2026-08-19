@@ -49,12 +49,20 @@ class CodeAgent:
     - 支持压缩触发和 Summary 生成
     """
     class _DeferredSubagentLauncher:
-        """Expose the Task launcher protocol without paying its startup cost."""
+        """Expose the Task launcher protocol without paying its startup cost.
+
+        接收 TaskTool 传来的 TaskRequest，转发给 SubagentLauncher.launch()。
+        TaskRequest 和 SubagentRequest 字段完全相同，Python 运行时只看字段值，
+        不做类型校验，因此可以直接传过去（鸭子类型）。
+        这样 task.py 不需要 import subagents.py，避免循环依赖。
+        """
 
         def __init__(self, get_launcher):
             self._get_launcher = get_launcher
 
         def launch(self, request):
+            # get_launcher() 惰性初始化 SubagentLauncher（首次调用才真正创建）
+            # request 是 TaskRequest，但和 SubagentRequest 字段完全一致，直接透传
             return self._get_launcher().launch(request)
     
     def __init__(
