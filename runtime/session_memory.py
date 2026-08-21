@@ -110,7 +110,16 @@ class SessionMemory:
 
 
 class SessionMemoryDeriver:
-    """Derive bounded working memory from transcript events."""
+    """从 transcript 事件流派生 SessionMemory（有界的工作记忆）。
+
+    SessionMemory 是 transcript 的压缩摘要，不是完整历史——
+    它只保留"当前目标是什么、完成了什么、失败了什么、关键决策"这类高层事实，
+    用于在 build_model_view() 里注入 system 消息（前馈给模型），
+    让模型跨 run 记住重要的历史背景，而不需要读全量 transcript。
+
+    rebuild：从零扫描所有事件，用于首次恢复或全量重建。
+    update：基于已有 SessionMemory 增量追加新事件，避免每次全量重建。
+    """
 
     def rebuild(self, events: Iterable["TranscriptEvent"]) -> SessionMemory:
         ordered = list(events)

@@ -152,7 +152,24 @@ class TranscriptSession:
 
 
 class TranscriptStore:
-    """Append-only JSONL transcript store."""
+    """Append-only JSONL transcript store.
+
+    每个 session 对应一个 JSONL 文件，每行一个 TranscriptEvent。
+    文件路径：memory/transcripts/transcript-{session_id}.jsonl
+
+    设计原则：只追加，不修改，不删除。
+    - 写入用文件锁保护（threading.Lock），防止并发写入损坏
+    - _repair_trailing_record 在每次写入前检查并修复末尾不完整的行
+      （应对进程在 write 和 flush 之间崩溃的情况）
+    - read_events 过滤 session_id，支持多 session 共用文件（目前不用，留作扩展）
+
+    五种事件类型对应 loop 的关键事实：
+      MESSAGE          用户/助手/工具的消息内容
+      STATE_TRANSITION loop 状态转移（原因 + 详情）
+      TOOL_LIFECYCLE   工具的 requested/started/completed/failed 四个阶段
+      CHECKPOINT       上下文压缩检查点（摘要 + 分割点）
+      TERMINAL         loop 终止（原因：completed/max_steps/token_budget/...）
+    """
 
     def __init__(self, path: str | Path, *, session_id: str):
         self.path = Path(path)
@@ -565,19 +582,35 @@ class TranscriptRecorder:
 
 
 class ResumeLoader:
-    """Reconstruct runtime facts from transcript events."""
+    """从 transcript 事件流重建运行时状态。
+
+    恢复逻辑：
+    1. 读取 JSONL 文件里所有事件（或指定 run_id 的事件）
+    2. MESSAGE 事件 → 重建 history_messages 列表（传给 HistoryManager.load_messages）
+    3. CHECKPOINT 事件 → 重建压缩检查点（传给 CompactStore.set_active）
+    4. TOOL_LIFECYCLE 事件 → 分析每个工具调用的四个阶段状态：
+       - completed：已完成，不重放
+       - failed：已失败，不重放
+       - requested 但未 started：未执行，pending（可重新触发）
+       - started 但无 completed/failed：uncertain（执行中断，状态未知）
+    5. TERMINAL 事件 → 判断是否正常结束
+
+    uncertain_actions 是恢复的关键概念：
+    工具已经开始执行但 agent 崩了，结果不知道（可能成功也可能失败）。
+    Edit/Bash/Task 被标记为 replay_allowed=False（不安全重放），
+    Read/Grep/Glob 可以重放（幂等）。
+    CLI 恢复时会打印 uncertain actions 列表，让用户决定是否继续。
+    """
 
     def __init__(self, store: TranscriptStore):
         self.store = store
 
     def load(self, *, run_id: str) -> ResumeState:
-        """Restore one requested run, retained for targeted transcript inspection."""
-
+        """恢复指定 run_id 的事件，用于精确定位某次运行。"""
         return self._load_events(self.store.read_events(run_id=run_id), run_id=str(run_id))
 
     def load_session(self) -> ResumeState:
-        """Restore all facts for the session in append order for continued work."""
-
+        """恢复整个 session 的所有事件，以最后一个事件的 run_id 为准（续跑用）。"""
         events = self.store.read_events()
         if not events:
             raise ValueError(f"Transcript session has no events: {self.store.session_id}")
